@@ -1,0 +1,49 @@
+@use "../settings" as *;
+
+
+.pure-menu-link {
+  padding: 0.5rem 1em;
+  line-height: 1.2rem;
+}
+
+#menu-mute, #menu-pause {
+  img {
+    height: 1.2rem;
+  }
+}
+
+
+.pure-menu-item {
+  height: initial;
+
+  // Mini POST forms (pause/mute/log out need a csrf_token) are layout-transparent,
+  // so the button inside sits where the plain <a> used to.
+  > form {
+    display: contents;
+  }
+
+  svg {
+    height: 1.2rem;
+  }
+  * {
+    vertical-align: middle;
+  }
+
+  .bi-heart {
+    &:hover {
+      cursor: pointer;
+    }
+  }
+
+  // Active menu item styling
+  &.active {
+    .pure-menu-link {
+      background-color: var(--color-background-menu-link-hover);
+      color: var(--color-text-menu-heading);
+    }
+  }
+
+  .action-icon {
+    stroke: var(--color-text-menu-heading);
+  }
+}

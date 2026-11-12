@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+
+from .util import set_original_response, live_server_setup, wait_for_all_checks
+from flask import url_for
+import io
+from zipfile import ZipFile, ZIP_DEFLATED
+import re
+import time
+from changedetectionio.model import Watch, Tag
+
+
+def test_backup(client, live_server, measure_memory_usage, datastore_path):
+    set_original_response(datastore_path=datastore_path)
+
+
+    # Add our URL to the import page
+    res = client.post(
+        url_for("imports.import_page"),
+        data={"urls": url_for('test_endpoint', _external=True)+"?somechar=őőőőőőőő"},
+        follow_redirects=True
+    )
+
+    assert b"1 Imported" in res.data
+    wait_for_all_checks(client)
+
+    # Launch the thread in the background to create the backup
+    res = client.post(
+        url_for("backups.request_backup"),
+        follow_redirects=True
+    )
+    time.sleep(4)
+
+    res = client.get(
+        url_for("backups.create"),
+        follow_redirects=True
+    )
+    # Can see the download link to the backup
+    assert b'<a href="/backups/download/changedetection-backup-20' in res.data
+    assert b'Remove backups' in res.data
+
+    # Get the latest one
+    res = client.get(
+        url_for("backups.download_backup", filename="latest"),
+        follow_redirects=True
+    )
+
+    # Should get the right zip content type
+    assert res.content_type == "application/zip"
+
+    # Should be PK/ZIP stream
+    assert res.data.count(b'PK') >= 2
+
+    backup = ZipFile(io.BytesIO(res.data))
+    l = backup.namelist()
+
+    # Check for UUID-based txt files (history, snapshot, and last-checksum)
+    uuid4hex_txt = re.compile('^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}.*txt', re.I)
+    txt_files = list(filter(uuid4hex_txt.match, l))
+    # Should be three txt files in the archive (history, snapshot, and last-checksum)
+    assert len(txt_files) == 3
+
+    # Check for watch.json files (new format)
+    uuid4hex_json = re.compile('^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}/watch\.json$', re.I)
+    json_files = list(filter(uuid4hex_json.match, l))
+    # Should be one watch.json file in the archive (the imported watch)
+    assert len(json_files) == 1, f"Expected 1 watch.json file, found {len(json_files)}: {json_files}"
+
+    # Check for changedetection.json (settings file)
+    assert 'changedetection.json' in l, "changedetection.json should be in backup"
+
+    # secret.txt must never be included — it contains the Flask session key
+    assert 'secret.txt' not in l, "secret.txt (Flask session key) must not be included in backup"
+
+    # Get the latest one
+    res = client.post(
+        url_for("backups.remove_backups"),
+        follow_redirects=True
+    )
+
+    assert b'No backups found.' in res.data
+
+
+def test_watch_data_package_download(client, live_server, measure_memory_usage, datastore_path):
+    """Test downloading a single watch's data as a zip package"""
+
+    set_original_response(datastore_path=datastore_path)
+
+    uuid = client.application.config.get('DATASTORE').add_watch(url=url_for('test_endpoint', _external=True))
+    tag_uuid = client.application.config.get('DATASTORE').add_tag(title="Tasty backup tag")
+    tag_uuid2 = client.application.config.get('DATASTORE').add_tag(title="Tasty backup tag number two")
+    client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
+
+    wait_for_all_checks(client)
+
+    # Download the watch data package
+    res = client.get(url_for("ui.ui_edit.watch_get_data_package", uuid=uuid))
+
+    # Should get the right zip content type
+    assert res.content_type == "application/zip"
+
+    # Should be PK/ZIP stream (PKzip header)
+    assert res.data[:2] == b'PK', "File should start with PK (PKzip header)"
+    assert res.data.count(b'PK') >= 2, "Should have multiple PK markers (zip file structure)"
+
+    # Verify zip contents
+    backup = ZipFile(io.BytesIO(res.data))
+    files = backup.namelist()
+
+    # Should have files in a UUID directory
+    assert any(uuid in f for f in files), f"Files should be in UUID directory: {files}"
+
+    # Should contain watch.json
+    watch_json_path = f"{uuid}/watch.json"
+    assert watch_json_path in files, f"Should contain watch.json, got: {files}"
+
+    # Should contain history/snapshot files
+    uuid4hex_txt = re.compile(f'^{re.escape(uuid)}/.*\\.txt', re.I)
+    txt_files = list(filter(uuid4hex_txt.match, files))
+    assert len(txt_files) > 0, f"Should have at least one .txt file (history/snapshot), got: {files}"
+
+
+def test_backup_restore(client, live_server, measure_memory_usage, datastore_path):
+    """Test that a full backup zip can be restored — watches and tags survive a round-trip."""
+
+    set_original_response(datastore_path=datastore_path)
+
+    datastore = live_server.app.config['DATASTORE']
+    watch_url = url_for('test_endpoint', _external=True)
+
+    # Set up: one watch and two tags
+    uuid = datastore.add_watch(url=watch_url)
+    tag_uuid = datastore.add_tag(title="Tasty backup tag")
+    tag_uuid2 = datastore.add_tag(title="Tasty backup tag number two")
+
+    client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
+    wait_for_all_checks(client)
+
+    # Create a full backup
+    client.post(url_for("backups.request_backup"), follow_redirects=True)
+    time.sleep(4)
+
+    # Download the latest backup zip
+    res = client.get(url_for("backups.download_backup", filename="latest"), follow_redirects=True)
+    assert res.content_type == "application/zip"
+    zip_data = res.data
+
+    # Confirm the zip contains both watch.json and tag.json entries
+    backup = ZipFile(io.BytesIO(zip_data))
+    names = backup.namelist()
+    assert f"{uuid}/watch.json" in names, f"watch.json missing from backup: {names}"
+    assert f"{tag_uuid}/tag.json" in names, f"tag.json for tag 1 missing from backup: {names}"
+    assert f"{tag_uuid2}/tag.json" in names, f"tag.json for tag 2 missing from backup: {names}"
+
+    # --- Wipe everything ---
+    datastore.delete('all')
+    client.post(url_for("tags.delete_all"), follow_redirects=True)
+
+    assert uuid not in datastore.data['watching'], "Watch should be gone after delete"
+    assert tag_uuid not in datastore.data['settings']['application']['tags'], "Tag 1 should be gone after delete"
+    assert tag_uuid2 not in datastore.data['settings']['application']['tags'], "Tag 2 should be gone after delete"
+
+    # --- Restore from the backup zip ---
+    res = client.post(
+        url_for("backups.restore.backups_restore_start"),
+        data={
+            'zip_file': (io.BytesIO(zip_data), 'backup.zip'),
+            'include_groups': 'y',
+            'include_groups_replace_existing': 'y',
+            'include_watches': 'y',
+            'include_watches_replace_existing': 'y',
+        },
+        content_type='multipart/form-data',
+        follow_redirects=True
+    )
+    assert res.status_code == 200
+
+    # Wait for the thread to finish
+    time.sleep(2)
+
+    # --- Watch checks ---
+    restored_watch = datastore.data['watching'].get(uuid)
+    assert restored_watch is not None, f"Watch {uuid} not found after restore"
+    assert restored_watch['url'] == watch_url, "Restored watch URL does not match"
+    assert isinstance(restored_watch, Watch.model), \
+        f"Watch not properly rehydrated, got {type(restored_watch)}"
+    assert restored_watch.history_n >= 1, \
+        f"Restored watch should have at least 1 history entry, got {restored_watch.history_n}"
+
+    # --- Tag checks ---
+    restored_tags = datastore.data['settings']['application']['tags']
+
+    restored_tag = restored_tags.get(tag_uuid)
+    assert restored_tag is not None, f"Tag {tag_uuid} not found after restore"
+    assert restored_tag['title'] == "Tasty backup tag", "Restored tag 1 title does not match"
+    assert isinstance(restored_tag, Tag.model), \
+        f"Tag 1 not properly rehydrated, got {type(restored_tag)}"
+
+    restored_tag2 = restored_tags.get(tag_uuid2)
+    assert restored_tag2 is not None, f"Tag {tag_uuid2} not found after restore"
+    assert restored_tag2['title'] == "Tasty backup tag number two", "Restored tag 2 title does not match"
+    assert isinstance(restored_tag2, Tag.model), \
+        f"Tag 2 not properly rehydrated, got {type(restored_tag2)}"
+
+
+def test_backup_restore_watch_without_interval_uses_default(client, live_server, measure_memory_usage, datastore_path):
+    """A restored watch with time_between_check_use_default=False but no interval of its own falls back to the default."""
+    import json
+    import uuid as uuid_builder
+    from changedetectionio.blueprint.backups.restore import import_from_zip
+
+    datastore = live_server.app.config['DATASTORE']
+    uuid = str(uuid_builder.uuid4())
+
+    backup_zip = io.BytesIO()
+    with ZipFile(backup_zip, 'w') as zf:
+        zf.writestr(f"{uuid}/watch.json", json.dumps({
+            'url': 'https://example.com',
+            'time_between_check_use_default': False,
+            'time_between_check': {'weeks': None, 'days': None, 'hours': None, 'minutes': None, 'seconds': None},
+        }))
+    backup_zip.seek(0)
+
+    import_from_zip(
+        zip_stream=backup_zip,
+        datastore=datastore,
+        include_groups=True,
+        include_groups_replace=True,
+        include_watches=True,
+        include_watches_replace=True,
+    )
+
+    assert datastore.data['watching'][uuid]['time_between_check_use_default'] is True
+
+
+def test_backup_restore_multiple_zips(client, live_server, measure_memory_usage, datastore_path):
+    """Several backup zips can be uploaded and restored in a single request."""
+
+    set_original_response(datastore_path=datastore_path)
+
+    datastore = live_server.app.config['DATASTORE']
+    watch_url = url_for('test_endpoint', _external=True)
+
+    uuid = datastore.add_watch(url=watch_url)
+    tag_uuid = datastore.add_tag(title="Tasty multi-zip tag")
+
+    client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
+    wait_for_all_checks(client)
+
+    client.post(url_for("backups.request_backup"), follow_redirects=True)
+    time.sleep(4)
+
+    res = client.get(url_for("backups.download_backup", filename="latest"), follow_redirects=True)
+    assert res.content_type == "application/zip"
+
+    # Split the backup into two zips, one holding the watch and one holding the group
+    watch_zip = io.BytesIO()
+    tag_zip = io.BytesIO()
+    with ZipFile(io.BytesIO(res.data)) as original, \
+            ZipFile(watch_zip, 'w') as wz, \
+            ZipFile(tag_zip, 'w') as tz:
+        for item in original.infolist():
+            if item.filename.startswith(f"{uuid}/"):
+                wz.writestr(item, original.read(item.filename))
+            elif item.filename.startswith(f"{tag_uuid}/"):
+                tz.writestr(item, original.read(item.filename))
+
+    datastore.delete('all')
+    client.post(url_for("tags.delete_all"), follow_redirects=True)
+    assert uuid not in datastore.data['watching']
+    assert tag_uuid not in datastore.data['settings']['application']['tags']
+
+    # The form field should allow selecting more than one file
+    res = client.get(url_for("backups.restore.restore"))
+    assert b'multiple' in res.data
+    assert b'Backup .ZIP file(s)' in res.data
+
+    res = client.post(
+        url_for("backups.restore.backups_restore_start"),
+        data={
+            'zip_file': [
+                (io.BytesIO(watch_zip.getvalue()), 'watches.zip'),
+                (io.BytesIO(tag_zip.getvalue()), 'groups.zip'),
+            ],
+            'include_groups': 'y',
+            'include_groups_replace_existing': 'y',
+            'include_watches': 'y',
+            'include_watches_replace_existing': 'y',
+        },
+        content_type='multipart/form-data',
+        follow_redirects=True
+    )
+    assert res.status_code == 200
+    assert b'Restore started in background' in res.data
+
+    time.sleep(2)
+
+    restored_watch = datastore.data['watching'].get(uuid)
+    assert restored_watch is not None, f"Watch {uuid} from the first zip not found after restore"
+    assert restored_watch['url'] == watch_url
+
+    restored_tag = datastore.data['settings']['application']['tags'].get(tag_uuid)
+    assert restored_tag is not None, f"Tag {tag_uuid} from the second zip not found after restore"
+    assert restored_tag['title'] == "Tasty multi-zip tag"
+
+
+def test_backup_restore_multiple_zips_rejects_non_zip(client, live_server, measure_memory_usage, datastore_path):
+    """If any of the uploaded files is not a .zip, nothing is restored."""
+
+    res = client.post(
+        url_for("backups.restore.backups_restore_start"),
+        data={
+            'zip_file': [
+                (io.BytesIO(b'PK'), 'good.zip'),
+                (io.BytesIO(b'not a zip'), 'evil.txt'),
+            ],
+            'include_watches': 'y',
+        },
+        content_type='multipart/form-data',
+        follow_redirects=True
+    )
+    assert res.status_code == 200
+    assert b'File must be a .zip backup file' in res.data
+
+
+def test_backup_restore_zip_slip_rejected(client, live_server, measure_memory_usage, datastore_path):
+    """Zip Slip path traversal entries in a restore zip must be rejected."""
+    import pytest
+    from changedetectionio.blueprint.backups.restore import import_from_zip
+
+    # Build a zip with a path traversal entry that would escape the extraction dir
+    malicious_zip = io.BytesIO()
+    with ZipFile(malicious_zip, 'w') as zf:
+        zf.writestr("../escaped.txt", "ATTACKER-CONTROLLED")
+    malicious_zip.seek(0)
+
+    datastore = live_server.app.config['DATASTORE']
+
+    with pytest.raises(ValueError, match="Zip Slip"):
+        import_from_zip(
+            zip_stream=malicious_zip,
+            datastore=datastore,
+            include_groups=True,
+            include_groups_replace=True,
+            include_watches=True,
+            include_watches_replace=True,
+        )
+
+
+def test_backup_restore_zip_bomb_rejected(client, live_server, measure_memory_usage, datastore_path):
+    """A zip whose total uncompressed size exceeds the limit must be rejected.
+
+    The guard reads file_size from the zip central-directory metadata — no
+    actual decompression happens, so this test is fast and uses minimal RAM.
+    100 KB of zeros compresses to ~100 bytes; monkeypatching the limit to
+    50 KB is enough to trigger the check without creating any large files.
+    """
+    import pytest
+    import changedetectionio.blueprint.backups.restore as restore_mod
+    from changedetectionio.blueprint.backups.restore import import_from_zip
+
+    # ~100 KB of zeros → deflate compresses to ~100 bytes, but file_size metadata = 100 KB
+    bomb_zip = io.BytesIO()
+    with ZipFile(bomb_zip, 'w', compression=ZIP_DEFLATED) as zf:
+        zf.writestr("data.txt", b"\x00" * (100 * 1024))
+    bomb_zip.seek(0)
+
+    datastore = live_server.app.config['DATASTORE']
+    original_limit = restore_mod._MAX_DECOMPRESSED_BYTES
+    try:
+        restore_mod._MAX_DECOMPRESSED_BYTES = 50 * 1024  # 50 KB limit for this test
+        with pytest.raises(ValueError, match="decompressed size"):
+            import_from_zip(
+                zip_stream=bomb_zip,
+                datastore=datastore,
+                include_groups=True,
+                include_groups_replace=True,
+                include_watches=True,
+                include_watches_replace=True,
+            )
+    finally:
+        restore_mod._MAX_DECOMPRESSED_BYTES = original_limit
+
+
+def test_backup_with_extended_utf8_urls_and_tags(datastore_path):
+    """Test create_backup handles extended UTF-8 characters in URLs and tags without encoding errors (issue #1805)."""
+    import os
+    import tempfile
+    from unittest.mock import MagicMock
+
+    from changedetectionio.blueprint.backups import create_backup
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        watch_mock = MagicMock()
+        watch_mock.data_dir = tmp_dir
+        watch_mock.__getitem__.side_effect = lambda key: (
+            "https://example.com/products/café-öl-日本語-🎉?query=test#section" if key == "url" else None
+        )
+        watch_mock.get.side_effect = lambda key, default=None: (
+            "https://example.com/products/café-öl-日本語-🎉?query=test#section"
+            if key == "url"
+            else (["Größe", "日本語タグ", "🏷️special"] if key == "tags" else default)
+        )
+
+        watches = {"test-uuid-1": watch_mock}
+        # Should create backup without UnicodeEncodeError
+        create_backup(datastore_path=tmp_dir, watches=watches, tags={})
+
+        url_list_path = os.path.join(tmp_dir, "url-list.txt")
+        url_list_tags_path = os.path.join(tmp_dir, "url-list-with-tags.txt")
+
+        assert os.path.isfile(url_list_path)
+        assert os.path.isfile(url_list_tags_path)
+
+        with open(url_list_path, encoding="utf-8") as f:
+            content = f.read()
+            assert "café-öl-日本語-🎉" in content
+
+        with open(url_list_tags_path, encoding="utf-8") as f:
+            content = f.read()
+            assert "café-öl-日本語-🎉" in content
+            assert "Größe" in content
+            assert "日本語タグ" in content
+            assert "🏷️special" in content

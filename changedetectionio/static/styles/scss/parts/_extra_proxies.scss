@@ -1,0 +1,85 @@
+ul#requests-extra_proxies {
+  list-style: none;
+  /* tidy up the table to look more "inline" */
+  li {
+    > label {
+      display: none;
+    }
+
+  }
+
+  /* each proxy entry is a `table` */
+  table {
+    tr {
+      display: table-row; // default display for small screens
+      input[type=text] {
+        width: 100%;
+      }
+    }
+  }
+  
+  // apply inline display for large screens
+  @media only screen and (min-width: 1024px) {
+    table {
+      tr {
+        display: inline;
+      }
+    }
+  }
+}
+
+#request {
+  /* Auto proxy scan/checker */
+  label[for=proxy] {
+    display: inline-block;
+  }
+}
+
+body.proxy-check-active {
+  #request {
+    // Padding set by flex layout
+    /*
+    .proxy-status {
+      width: 2em;
+    }
+    */
+
+    .proxy-check-details {
+      font-size: 80%;
+      color: #555;
+      display: block;
+      padding-left: 2em;
+      max-width: 500px;
+    }
+
+    .proxy-timing {
+      font-size: 80%;
+      padding-left: 1rem;
+      color: var(--color-link);
+    }
+  }
+}
+
+
+#recommended-proxy {
+  display: grid;
+  gap: 2rem;
+  padding-bottom: 1em;
+  
+  @media  (min-width: 991px) {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  > div {
+    border: 1px #aaa solid;
+    border-radius: 4px;
+    padding: 1em;
+  }
+}
+
+#extra-proxies-setting {
+  border: 1px solid var(--color-grey-800);
+  border-radius: 4px;
+    margin: 1em;
+   padding: 1em;
+}

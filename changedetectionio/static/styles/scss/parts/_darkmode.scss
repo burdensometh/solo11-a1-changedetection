@@ -1,0 +1,24 @@
+@use "../settings" as *;
+
+.toggle-light-mode {
+  /* default */
+  .icon-dark {
+    display: none;
+  }
+}
+
+@include dark-mode {
+  .toggle-light-mode {
+    .icon-light {
+      display: none;
+    }
+
+    .icon-dark {
+      display: block;
+    }
+  }
+}
+
+
+
+

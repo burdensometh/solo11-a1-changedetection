@@ -1,0 +1,262 @@
+/**
+ * Modern modal dialog system using HTML5 <dialog> element
+ * Provides accessible, animated confirmation dialogs
+ */
+
+// Escapes a string for safe insertion via innerHTML
+function _modalEscapeHTML(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// Translatable strings are injected by base.html into window.ModalDialogI18n so
+// Babel can extract them from the Jinja template. Fall back to English when a
+// key is missing (e.g. a page that renders modal.js without the bridge).
+function _modalT(key, fallback) {
+  const i18n = window.ModalDialogI18n || {};
+  return (key in i18n) ? i18n[key] : fallback;
+}
+
+const ModalDialog = {
+  /**
+   * Show a confirmation dialog
+   * @param {Object} options - Configuration options
+   * @param {string} options.title - Dialog title
+   * @param {string} options.message - Dialog message (can include HTML)
+   * @param {string} options.type - Dialog type: 'danger', 'warning', or 'info' (default: 'info')
+   * @param {string} options.confirmText - Confirm button text (default: 'Confirm')
+   * @param {string} options.cancelText - Cancel button text (default: 'Cancel')
+   * @param {Function} options.onConfirm - Callback when confirmed
+   * @param {Function} options.onCancel - Callback when cancelled (optional)
+   * @returns {Promise} Resolves with true if confirmed, false if cancelled
+   */
+  confirm: function(options) {
+    return new Promise((resolve) => {
+      const defaults = {
+        title: _modalT('confirmTitle', 'Confirm Action'),
+        message: _modalT('confirmMessage', 'Are you sure?'),
+        type: 'info',
+        confirmText: _modalT('confirm', 'Confirm'),
+        cancelText: _modalT('cancel', 'Cancel'),
+        onConfirm: null,
+        onCancel: null
+      };
+
+      const config = { ...defaults, ...options };
+
+      // Icon mapping
+      const icons = {
+        danger: '⚠️',
+        warning: '⚠️',
+        info: 'ℹ️'
+      };
+
+      // Create dialog element
+      const dialog = document.createElement('dialog');
+      dialog.className = 'modal-dialog';
+      dialog.setAttribute('aria-labelledby', 'modal-title');
+      dialog.setAttribute('aria-describedby', 'modal-body');
+
+      // Build dialog content
+      dialog.innerHTML = `
+        <div class="modal-header">
+          <span class="modal-icon ${config.type}">${icons[config.type] || icons.info}</span>
+          <h2 class="modal-title" id="modal-title">${config.title}</h2>
+        </div>
+        <div class="modal-body" id="modal-body">
+          ${config.message}
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="modal-btn-cancel pure-button" data-action="cancel">
+            ${config.cancelText}
+          </button>
+          <button type="button" class="modal-btn-${config.type} pure-button" data-action="confirm">
+            ${config.confirmText}
+          </button>
+        </div>
+      `;
+
+      // Append to body
+      document.body.appendChild(dialog);
+
+      // Handle button clicks
+      const handleClose = (confirmed) => {
+        dialog.close();
+        setTimeout(() => {
+          dialog.remove();
+        }, 200);
+
+        if (confirmed && config.onConfirm) {
+          config.onConfirm();
+        } else if (!confirmed && config.onCancel) {
+          config.onCancel();
+        }
+
+        resolve(confirmed);
+      };
+
+      // Attach event listeners
+      dialog.querySelector('[data-action="confirm"]').addEventListener('click', () => {
+        handleClose(true);
+      });
+
+      dialog.querySelector('[data-action="cancel"]').addEventListener('click', () => {
+        handleClose(false);
+      });
+
+      // Handle Escape key
+      dialog.addEventListener('cancel', (e) => {
+        e.preventDefault();
+        handleClose(false);
+      });
+
+      // Handle backdrop click
+      dialog.addEventListener('click', (e) => {
+        const rect = dialog.getBoundingClientRect();
+        if (
+          e.clientY < rect.top ||
+          e.clientY > rect.bottom ||
+          e.clientX < rect.left ||
+          e.clientX > rect.right
+        ) {
+          handleClose(false);
+        }
+      });
+
+      // Show dialog
+      dialog.showModal();
+
+      // Focus confirm button for accessibility
+      setTimeout(() => {
+        dialog.querySelector('[data-action="confirm"]').focus();
+      }, 100);
+    });
+  },
+
+  /**
+   * Helper method for delete confirmations
+   * @param {string} itemName - Name of the item being deleted
+   * @param {Function} onConfirm - Callback when confirmed
+   */
+  confirmDelete: function(itemName, onConfirm) {
+    const safeName = _modalEscapeHTML(itemName);
+    return this.confirm({
+      title: _modalT('deleteTitle', 'Delete %(name)s?').split('%(name)s').join(safeName),
+      message: _modalT('deleteMessage', '<p>Are you sure you want to delete <strong>%(name)s</strong>?</p><p>This action cannot be undone.</p>').split('%(name)s').join(safeName),
+      type: 'danger',
+      confirmText: _modalT('delete', 'Delete'),
+      cancelText: _modalT('cancel', 'Cancel'),
+      onConfirm: onConfirm
+    });
+  },
+
+  /**
+   * Helper method for unlink confirmations
+   * @param {string} itemName - Name of the item being unlinked
+   * @param {Function} onConfirm - Callback when confirmed
+   */
+  confirmUnlink: function(itemName, onConfirm) {
+    const safeName = _modalEscapeHTML(itemName);
+    return this.confirm({
+      title: _modalT('unlinkTitle', 'Unlink %(name)s?').split('%(name)s').join(safeName),
+      message: _modalT('unlinkMessage', '<p>Are you sure you want to unlink all watches from <strong>%(name)s</strong>?</p><p>The tag will be kept but watches will be removed from it.</p>').split('%(name)s').join(safeName),
+      type: 'warning',
+      confirmText: _modalT('unlink', 'Unlink'),
+      cancelText: _modalT('cancel', 'Cancel'),
+      onConfirm: onConfirm
+    });
+  }
+};
+
+// Make available globally
+window.ModalDialog = ModalDialog;
+
+/**
+ * Submit `url` as a POST carrying the CSRF token, via a throwaway body-level form.
+ *
+ * Body-level (rather than wrapping the link) because these links often live inside another
+ * <form> - the watch list and the edit page both do - and nested forms are invalid HTML that
+ * browsers silently drop. The token comes from the global `csrftoken` set in base.html.
+ *
+ * Used for state-changing actions that must not be reachable by GET, otherwise an
+ * <img src="...">  on any page the operator visits performs the action for them.
+ */
+function postWithCsrf(url) {
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = url;
+  form.style.display = 'none';
+  if (typeof csrftoken !== 'undefined' && csrftoken) {
+    const tok = document.createElement('input');
+    tok.type = 'hidden';
+    tok.name = 'csrf_token';
+    tok.value = csrftoken;
+    form.appendChild(tok);
+  }
+  document.body.appendChild(form);
+  form.submit();
+}
+window.postWithCsrf = postWithCsrf;
+
+/**
+ * Anchors marked data-method="POST" that do NOT also ask for confirmation.
+ * (The confirm variant is handled in the data-requires-confirm handler below.)
+ */
+$(document).ready(function() {
+  $(document).on('click', 'a[data-method="POST"]:not([data-requires-confirm])', function(e) {
+    e.preventDefault();
+    postWithCsrf($(this).attr('href'));
+  });
+});
+
+/**
+ * Auto-attach modal confirmations to links with data-requires-confirm attribute
+ * Usage in HTML:
+ * <a href="/delete"
+ *    data-requires-confirm
+ *    data-confirm-type="danger"
+ *    data-confirm-title="Delete Item?"
+ *    data-confirm-message="Are you sure?"
+ *    data-confirm-button="Delete">
+ */
+$(document).ready(function() {
+  $(document).on('click', 'a[data-requires-confirm], button[data-requires-confirm]', function(e) {
+    e.preventDefault();
+    const $element = $(this);
+    const url = $element.attr('href');
+
+    const config = {
+      type: $element.attr('data-confirm-type') || 'danger',
+      title: $element.attr('data-confirm-title') || _modalT('confirmTitle', 'Confirm Action'),
+      message: $element.attr('data-confirm-message') || _modalT('proceedMessage', '<p>Are you sure you want to proceed?</p>'),
+      confirmText: $element.attr('data-confirm-button') || _modalT('confirm', 'Confirm'),
+      cancelText: $element.attr('data-cancel-button') || _modalT('cancel', 'Cancel'),
+      onConfirm: function() {
+        // data-method="POST" — build a body-level hidden form with the CSRF
+        // token and submit it. Avoids nested-form HTML invalidity when the
+        // anchor lives inside an outer <form> (e.g. settings tabs). The CSRF
+        // token comes from the global `csrftoken` set in base.html.
+        // GHSA-g36r-fm2p-87xm: anchors that mutate server state must not fire
+        // on a bare GET, since <img src=...> CSRF relies on GET firing.
+        const method = ($element.attr('data-method') || 'GET').toUpperCase();
+        if (method === 'POST') {
+          postWithCsrf(url);
+          return;
+        }
+
+        // If it's a link, navigate to the URL
+        if ($element.is('a')) {
+          window.location.href = url;
+        }
+        // If it's a button in a form, submit the form
+        else if ($element.is('button')) {
+          // Use requestSubmit() to include the button's name/value in the form data
+          $element.closest('form')[0].requestSubmit($element[0]);
+        }
+      }
+    };
+
+    ModalDialog.confirm(config);
+  });
+});

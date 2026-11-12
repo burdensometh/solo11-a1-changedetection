@@ -1,0 +1,810 @@
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import websockets.exceptions
+from urllib.parse import urlparse
+
+from loguru import logger
+
+from changedetectionio.content_fetchers import SCREENSHOT_MAX_HEIGHT_DEFAULT, visualselector_xpath_selectors, \
+    SCREENSHOT_SIZE_STITCH_THRESHOLD, SCREENSHOT_DEFAULT_QUALITY, XPATH_ELEMENT_JS, INSTOCK_DATA_JS, \
+    SCREENSHOT_MAX_TOTAL_HEIGHT, FAVICON_FETCHER_JS
+from changedetectionio import gc_debounce
+from changedetectionio.content_fetchers.base import Fetcher, get_playwright_bypass_csp, manage_user_agent
+from changedetectionio.proxy_url import proxy_credentials
+from changedetectionio.content_fetchers.exceptions import PageUnloadable, Non200ErrorCodeReceived, EmptyReply, BrowserFetchTimedOut, \
+    BrowserConnectError
+
+
+async def _configure_puppeteer_csp(page):
+    """Enable CSP bypass without requiring unsupported CDP methods when disabled."""
+    if get_playwright_bypass_csp():
+        await page.setBypassCSP(True)
+
+
+# Bug 3 in Playwright screenshot handling
+# Some bug where it gives the wrong screenshot size, but making a request with the clip set first seems to solve it
+
+# Screenshots also travel via the ws:// (websocket) meaning that the binary data is base64 encoded
+# which will significantly increase the IO size between the server and client, it's recommended to use the lowest
+# acceptable screenshot quality here
+async def capture_full_page(page, screenshot_format='JPEG', watch_uuid=None, lock_viewport_elements=False):
+    import os
+    import time
+
+    start = time.time()
+    watch_info = f"[{watch_uuid}] " if watch_uuid else ""
+
+    setup_start = time.time()
+    page_height = await page.evaluate("document.documentElement.scrollHeight")
+    page_width = await page.evaluate("document.documentElement.scrollWidth")
+    original_viewport = page.viewport
+    dimensions_time = time.time() - setup_start
+
+    logger.debug(f"{watch_info}Puppeteer viewport size {page.viewport} page height {page_height} page width {page_width} (got dimensions in {dimensions_time:.2f}s)")
+
+    # Bug 3 in Playwright screenshot handling
+    # Some bug where it gives the wrong screenshot size, but making a request with the clip set first seems to solve it
+    # JPEG is better here because the screenshots can be very very large
+
+    # Screenshots also travel via the ws:// (websocket) meaning that the binary data is base64 encoded
+    # which will significantly increase the IO size between the server and client, it's recommended to use the lowest
+    # acceptable screenshot quality here
+
+    # Use PNG for better quality (no compression artifacts), JPEG for smaller size
+    screenshot_type = screenshot_format.lower() if screenshot_format else 'jpeg'
+    # PNG should use quality 100, JPEG uses configurable quality
+    screenshot_quality = 100 if screenshot_type == 'png' else int(os.getenv("SCREENSHOT_QUALITY", 72))
+
+    step_size = SCREENSHOT_SIZE_STITCH_THRESHOLD # Something that will not cause the GPU to overflow when taking the screenshot
+    screenshot_chunks = []
+    y = 0
+    elements_locked = False
+
+    # Only lock viewport elements if explicitly enabled (for image_ssim_diff processor)
+    # This prevents headers/ads from resizing when viewport changes
+    if lock_viewport_elements and page_height > page.viewport['height']:
+        lock_start = time.time()
+        lock_elements_js_path = os.path.join(os.path.dirname(__file__), 'res', 'lock-elements-sizing.js')
+        file_read_start = time.time()
+        with open(lock_elements_js_path, 'r', encoding='utf-8') as f:
+            lock_elements_js = f.read()
+        file_read_time = time.time() - file_read_start
+
+        evaluate_start = time.time()
+        await page.evaluate(lock_elements_js)
+        evaluate_time = time.time() - evaluate_start
+
+        elements_locked = True
+        lock_time = time.time() - lock_start
+        logger.debug(f"{watch_info}Viewport element locking enabled - File read: {file_read_time:.3f}s, Browser evaluate: {evaluate_time:.2f}s, Total: {lock_time:.2f}s")
+
+    if page_height > page.viewport['height']:
+        if page_height < step_size:
+            step_size = page_height # Incase page is bigger than default viewport but smaller than proposed step size
+        # Never set viewport taller than our max capture height - otherwise one screenshot chunk
+        # captures the whole page even when SCREENSHOT_MAX_HEIGHT is set smaller
+        step_size = min(step_size, SCREENSHOT_MAX_TOTAL_HEIGHT)
+        viewport_start = time.time()
+        await page.setViewport({'width': page.viewport['width'], 'height': step_size})
+        viewport_time = time.time() - viewport_start
+        logger.debug(f"{watch_info}Viewport changed to {page.viewport['width']}x{step_size} (took {viewport_time:.2f}s)")
+
+    capture_start = time.time()
+    chunk_times = []
+    while y < min(page_height, SCREENSHOT_MAX_TOTAL_HEIGHT):
+        # better than scrollTo incase they override it in the page
+        await page.evaluate(
+            """(y) => {
+                const el = document.scrollingElement;
+                if (el) el.scrollTop = y;
+            }""",
+            y
+        )
+
+        screenshot_kwargs = {
+            'type_': screenshot_type,
+            'fullPage': False
+        }
+        # PNG doesn't support quality parameter in Puppeteer
+        if screenshot_type == 'jpeg':
+            screenshot_kwargs['quality'] = screenshot_quality
+
+        chunk_start = time.time()
+        screenshot_chunks.append(await page.screenshot(**screenshot_kwargs))
+        chunk_time = time.time() - chunk_start
+        chunk_times.append(chunk_time)
+        logger.debug(f"{watch_info}Chunk {len(screenshot_chunks)} captured in {chunk_time:.2f}s")
+        y += step_size
+
+    await page.setViewport({'width': original_viewport['width'], 'height': original_viewport['height']})
+
+    # Unlock element dimensions if they were locked
+    if elements_locked:
+        unlock_elements_js_path = os.path.join(os.path.dirname(__file__), 'res', 'unlock-elements-sizing.js')
+        with open(unlock_elements_js_path, 'r', encoding='utf-8') as f:
+            unlock_elements_js = f.read()
+        await page.evaluate(unlock_elements_js)
+        logger.debug(f"{watch_info}Element dimensions unlocked after screenshot capture")
+
+    capture_time = time.time() - capture_start
+    total_capture_time = sum(chunk_times)
+    logger.debug(f"{watch_info}All {len(screenshot_chunks)} chunks captured in {capture_time:.2f}s (total chunk time: {total_capture_time:.2f}s)")
+
+    if len(screenshot_chunks) > 1:
+        stitch_start = time.time()
+        logger.debug(f"{watch_info}Starting stitching of {len(screenshot_chunks)} chunks")
+
+        # Always use spawn subprocess for ANY stitching (2+ chunks)
+        # PIL allocates at C level and Python GC never releases it - subprocess exit forces OS to reclaim
+        # Trade-off: 35MB resource_tracker vs 500MB+ PIL leak in main process
+        from changedetectionio.content_fetchers.screenshot_handler import stitch_images_worker_raw_bytes
+        import multiprocessing
+        import struct
+
+        ctx = multiprocessing.get_context('spawn')
+        parent_conn, child_conn = ctx.Pipe()
+        p = ctx.Process(target=stitch_images_worker_raw_bytes, args=(child_conn, page_height, SCREENSHOT_MAX_TOTAL_HEIGHT))
+        p.start()
+
+        # Send via raw bytes (no pickle)
+        parent_conn.send_bytes(struct.pack('I', len(screenshot_chunks)))
+        for chunk in screenshot_chunks:
+            parent_conn.send_bytes(chunk)
+
+        screenshot = parent_conn.recv_bytes()
+        p.join()
+
+        parent_conn.close()
+        child_conn.close()
+        del p, parent_conn, child_conn
+
+        stitch_time = time.time() - stitch_start
+        total_time = time.time() - start
+        setup_time = total_time - capture_time - stitch_time
+        logger.debug(
+            f"{watch_info}Screenshot complete - Page height: {page_height}px, Capture height: {SCREENSHOT_MAX_TOTAL_HEIGHT}px | "
+            f"Setup: {setup_time:.2f}s, Capture: {capture_time:.2f}s, Stitching: {stitch_time:.2f}s, Total: {total_time:.2f}s")
+        return screenshot
+
+    total_time = time.time() - start
+    setup_time = total_time - capture_time
+    logger.debug(
+        f"{watch_info}Screenshot complete - Page height: {page_height}px, Capture height: {SCREENSHOT_MAX_TOTAL_HEIGHT}px | "
+        f"Setup: {setup_time:.2f}s, Single chunk: {capture_time:.2f}s, Total: {total_time:.2f}s")
+    return screenshot_chunks[0]
+
+
+class fetcher(Fetcher):
+    fetcher_description = "Puppeteer/direct {}/Javascript".format(
+        os.getenv("PLAYWRIGHT_BROWSER_TYPE", 'chromium').capitalize()
+    )
+    if os.getenv("PLAYWRIGHT_DRIVER_URL"):
+        fetcher_description += " via '{}'".format(os.getenv("PLAYWRIGHT_DRIVER_URL"))
+
+    browser = None
+    browser_type = ''
+    command_executor = ''
+    proxy = None
+
+    # Capability flags
+    supports_browser_steps = True
+    supports_screenshots = True
+    supports_xpath_element_data = True
+    supports_pdf = True
+
+    @classmethod
+    def get_status_icon_data(cls):
+        """Return Chrome browser icon data for Puppeteer fetcher."""
+        return {
+            'filename': 'google-chrome-icon.png',
+            'alt': 'Using a Chrome browser',
+            'title': 'Using a Chrome browser'
+        }
+
+    def __init__(self, proxy_override=None, custom_browser_connection_url=None, **kwargs):
+        super().__init__(**kwargs)
+
+        # Renderer crashes recorded during the fetch, see the 'error' handler in fetch_page().
+        # Set up here so run()'s finally can always report, even if we never got as far as a page.
+        self.page_errors = []
+
+        if custom_browser_connection_url:
+            self.browser_connection_is_custom = True
+            self.browser_connection_url = custom_browser_connection_url
+        else:
+            # Fallback to fetching from system
+            # .strip('"') is going to save someone a lot of time when they accidently wrap the env value
+            self.browser_connection_url = os.getenv("PLAYWRIGHT_DRIVER_URL", 'ws://playwright-chrome:3000').strip('"')
+
+        # allow per-watch proxy selection override
+        # @todo check global too?
+        if proxy_override:
+            # Playwright needs separate username and password values
+            parsed = urlparse(proxy_override)
+            if parsed:
+                username, password = proxy_credentials(proxy_override)
+                self.proxy = {'username': username, 'password': password}
+                # Add the proxy server chrome start option, the username and password never gets added here
+                # (It always goes in via await self.page.authenticate(self.proxy))
+
+                # @todo filter some injection attack?
+                # check scheme when no scheme
+                proxy_url = parsed.scheme + "://" if parsed.scheme else 'http://'
+                r = "?" if not '?' in self.browser_connection_url else '&'
+                port = ":"+str(parsed.port) if parsed.port else ''
+                q = "?"+parsed.query if parsed.query else ''
+                proxy_url += f"{parsed.hostname}{port}{parsed.path}{q}"
+                self.browser_connection_url += f"{r}--proxy-server={proxy_url}"
+
+    async def quit(self, watch=None):
+        watch_uuid = watch.get('uuid') if watch else 'unknown'
+        closed_something = bool(getattr(self, 'page', None) or getattr(self, 'browser', None))
+
+        # Close page
+        try:
+            if hasattr(self, 'page') and self.page:
+                await asyncio.wait_for(self.page.close(), timeout=5.0)
+                logger.debug(f"[{watch_uuid}] Page closed successfully")
+        except asyncio.TimeoutError:
+            logger.warning(f"[{watch_uuid}] Timed out closing page (5s)")
+        except Exception as e:
+            logger.warning(f"[{watch_uuid}] Error closing page: {e}")
+        finally:
+            self.page = None
+
+        # Close browser connection
+        try:
+            if hasattr(self, 'browser') and self.browser:
+                await asyncio.wait_for(self.browser.close(), timeout=5.0)
+                logger.debug(f"[{watch_uuid}] Browser closed successfully")
+        except asyncio.TimeoutError:
+            logger.warning(f"[{watch_uuid}] Timed out closing browser (5s)")
+        except Exception as e:
+            logger.warning(f"[{watch_uuid}] Error closing browser: {e}")
+        finally:
+            self.browser = None
+
+        logger.info(f"[{watch_uuid}] Cleanup puppeteer complete")
+
+        # Only collect if this call actually closed something.
+        #
+        # quit() runs twice per check - from run()'s finally, then again from the worker's
+        # safety net - and it sets self.page/self.browser to None in its own finally
+        # blocks. The second call therefore closes nothing, creates no garbage and breaks
+        # no cycles, but still paid for a full stop-the-world collection: measured at 88
+        # calls across 51 checks, roughly half of them reclaiming nothing. The pyppeteer
+        # page/connection/session graph is genuinely cyclic, so the first call still runs.
+        if closed_something:
+            gc_debounce.collect('puppeteer.quit')
+
+    async def fetch_page(self,
+                         current_include_filters,
+                         empty_pages_are_a_change,
+                         fetch_favicon,
+                         ignore_status_codes,
+                         is_binary,
+                         request_body,
+                         request_headers,
+                         request_method,
+                         screenshot_format,
+                         timeout,
+                         url,
+                         watch_uuid
+                         ):
+        import re
+        self.delete_browser_steps_screenshots()
+
+        n = int(os.getenv("WEBDRIVER_DELAY_BEFORE_CONTENT_READY", 12)) + self.render_extract_delay
+        extra_wait = min(n, 15)
+
+        logger.debug(f"Extra wait set to {extra_wait}s, requested was {n}s.")
+
+        from pyppeteer import Pyppeteer
+        pyppeteer_instance = Pyppeteer()
+
+        # Connect directly using the specified browser_ws_endpoint
+        # @todo timeout
+        try:
+            logger.debug(f"[{watch_uuid}] Connecting to browser at {self.browser_connection_url}")
+            self.browser = await pyppeteer_instance.connect(browserWSEndpoint=self.browser_connection_url,
+                                                            ignoreHTTPSErrors=True
+                                                            )
+            logger.debug(f"[{watch_uuid}] Browser connected successfully")
+        except websockets.exceptions.InvalidStatusCode as e:
+            raise BrowserConnectError(msg=f"Error while trying to connect the browser, Code {e.status_code} (check your access, whitelist IP, password etc)")
+        except websockets.exceptions.InvalidURI:
+            raise BrowserConnectError(msg=f"Error connecting to the browser, check your browser connection address (should be ws:// or wss://")
+        except Exception as e:
+            raise BrowserConnectError(msg=f"Error connecting to the browser - Exception '{str(e)}'")
+
+        # more reliable is to just request a new page
+        try:
+            logger.debug(f"[{watch_uuid}] Creating new page")
+            self.page = await self.browser.newPage()
+            logger.debug(f"[{watch_uuid}] Page created successfully")
+        except Exception as e:
+            logger.error(f"[{watch_uuid}] Failed to create new page: {e}")
+            # Browser is connected but page creation failed - must cleanup browser
+            try:
+                await asyncio.wait_for(self.browser.close(), timeout=3.0)
+            except Exception as cleanup_error:
+                logger.error(f"[{watch_uuid}] Failed to cleanup browser after page creation failure: {cleanup_error}")
+            finally:
+                self.browser = None
+            raise
+        
+        # A renderer crash makes pyppeteer emit Page 'error' (PageError('Page crashed!')).
+        # pyee re-raises an 'error' emission that has no listener, and that raise escapes into
+        # Connection._onMessage, whose catch-all disposes the entire connection - so one dead
+        # tab takes the whole browser with it and every later call reports the misleading
+        # "Session closed. Most likely the page has been closed." Attaching a listener keeps
+        # the failure local, named, and recoverable.
+        #
+        # A single page load can emit 'error' more than once (an iframe renderer going down, then
+        # the main one), so collect them all rather than keeping only the last.
+        self.page_errors = []
+
+        def _handle_page_error(e):
+            self.page_errors.append(e)
+            logger.error(f"[{watch_uuid}] Page error (the renderer likely crashed, often OOM): {e}")
+
+        self.page.on('error', _handle_page_error)
+
+        # Add console handler to capture console.log from favicon fetcher
+        #self.page.on('console', lambda msg: logger.debug(f"Browser console [{msg.type}]: {msg.text}"))
+
+        if '--window-size' in self.browser_connection_url:
+            # Be sure the viewport is always the window-size, this is often not the same thing
+            match = re.search(r'--window-size=(\d+),(\d+)', self.browser_connection_url)
+            if match:
+                logger.debug(f"Setting viewport to same as --window-size in browser connection URL {int(match.group(1))},{int(match.group(2))}")
+                await self.page.setViewport({
+                    "width": int(match.group(1)),
+                    "height": int(match.group(2))
+                })
+                logger.debug(f"Puppeteer viewport size {self.page.viewport}")
+        try:
+            from pyppeteerstealth import inject_evasions_into_page
+        except ImportError:
+            logger.debug("pyppeteerstealth module not available, skipping")
+            pass
+        else:
+            # I tried hooking events via self.page.on(Events.Page.DOMContentLoaded, inject_evasions_requiring_obj_to_page)
+            # But I could never get it to fire reliably, so we just inject it straight after
+            await inject_evasions_into_page(self.page)
+
+        # This user agent is similar to what was used when tweaking the evasions in inject_evasions_into_page(..)
+        user_agent = None
+        if request_headers and request_headers.get('User-Agent'):
+            # Request_headers should now be CaaseInsensitiveDict
+            # Remove it so it's not sent again with headers after
+            user_agent = request_headers.pop('User-Agent').strip()
+            await self.page.setUserAgent(user_agent)
+
+        if not user_agent:
+            # Attempt to strip 'HeadlessChrome' etc
+            await self.page.setUserAgent(manage_user_agent(headers=request_headers, current_ua=await self.page.evaluate('navigator.userAgent')))
+
+        await _configure_puppeteer_csp(self.page)
+        if request_headers:
+            await self.page.setExtraHTTPHeaders(request_headers)
+
+        # SOCKS5 with authentication is not supported (yet)
+        # https://github.com/microsoft/playwright/issues/10567
+        self.page.setDefaultNavigationTimeout(0)
+        await self.page.setCacheEnabled(True)
+        if self.proxy and self.proxy.get('username'):
+            # Setting Proxy-Authentication header is deprecated, and doing so can trigger header change errors from Puppeteer
+            # https://github.com/puppeteer/puppeteer/issues/676 ?
+            # https://help.brightdata.com/hc/en-us/articles/12632549957649-Proxy-Manager-How-to-Guides#h_01HAKWR4Q0AFS8RZTNYWRDFJC2
+            # https://cri.dev/posts/2020-03-30-How-to-solve-Puppeteer-Chrome-Error-ERR_INVALID_ARGUMENT/
+            await self.page.authenticate(self.proxy)
+
+        # Re-use as much code from browser steps as possible so its the same
+        # from changedetectionio.blueprint.browser_steps.browser_steps import steppable_browser_interface
+
+        # not yet used here, we fallback to playwright when browsersteps is required
+        #            browsersteps_interface = steppable_browser_interface()
+        #            browsersteps_interface.page = self.page
+
+        # Enable Network domain to detect when first bytes arrive
+        await self.page._client.send('Network.enable')
+
+        # Navigate (bounded), then wait the configured "wait n seconds before extracting text"
+        # delay, then stop whatever is still loading, then extract. The delay is measured from
+        # when navigation finished, not from when it started, because the point of it is to let
+        # JS-rendered content appear *after* load - anchoring it to the start would quietly give a
+        # slow-loading page almost no settle time.
+        #
+        # Only that delay is a user-facing setting. The navigation bound above is a safety net with
+        # a sane default, not a tuning knob, so there is still one number for users to think about.
+        #
+        # There is no way to know a page is "finished" - plenty of sites navigate as part of their
+        # normal design, and some sit forever on a subresource that never answers. So the delay
+        # restarts if the MAIN frame replaces its document (a redirect or interstitial gets the
+        # same settle time the first document got), iframes do not restart it, and it is capped so
+        # a page that re-navigates in a loop cannot extend it indefinitely.
+        max_content_ready_resets = int(os.getenv("BROWSER_CONTENT_READY_MAX_RESETS", 2))
+
+        async def wait_for_content_ready_then_stop_loading():
+            main_frame_id = self.page.mainFrame._id
+            renavigated = asyncio.Event()
+
+            def _on_main_frame_navigation(event):
+                if event.get('frameId') == main_frame_id:
+                    renavigated.set()
+
+            self.page._client.on('Page.frameStartedLoading', _on_main_frame_navigation)
+            self.page._client.on('Page.frameStoppedLoading', lambda e: logger.debug(f"Frame stopped loading: {e}"))
+            try:
+                resets = 0
+                while True:
+                    renavigated.clear()
+                    try:
+                        await asyncio.wait_for(renavigated.wait(), timeout=extra_wait)
+                        # Main frame started a new document
+                        resets += 1
+                        if resets > max_content_ready_resets:
+                            # The cap is there to stop a page that re-navigates in a loop from
+                            # extending the fetch forever - it is NOT permission to extract
+                            # immediately. Breaking straight out here landed on whatever document
+                            # happened to be mid-flight, with zero settle time: measured against a
+                            # page that hops every 500ms, the fetch ended after 2.7s holding 130
+                            # bytes of an intermediate hop, no final document and no JS-rendered
+                            # content, while logging "content-ready wait of 12s elapsed".
+                            #
+                            # So spend the delay one last time, just without arming another reset.
+                            # Total stays bounded at (max_resets + 2) * extra_wait, and whatever we
+                            # extract has had the same settle time every other fetch gets.
+                            logger.debug(f"Main frame re-navigated {resets} times (cap "
+                                         f"{max_content_ready_resets}), waiting {extra_wait}s once "
+                                         f"more without restarting, then extracting regardless")
+                            await asyncio.sleep(extra_wait)
+                            break
+                        logger.debug(f"Main frame started a new document, restarting the {extra_wait}s "
+                                     f"content-ready wait ({resets}/{max_content_ready_resets})")
+                    except asyncio.TimeoutError:
+                        # Quiet for the whole delay - the page is as ready as it is going to get
+                        break
+            finally:
+                self.page._client.remove_listener('Page.frameStartedLoading', _on_main_frame_navigation)
+
+            # Stop whatever is still in flight so the DOM and screenshot come from what rendered,
+            # rather than waiting on a subresource that may never answer
+            try:
+                logger.debug(f"Content-ready wait finished, issuing Page.stopLoading before extracting")
+                await self.page._client.send('Page.stopLoading')
+                logger.debug("stopLoading command sent!")
+
+                # stopLoading stops the network, not script execution. A page whose JS has pegged
+                # the renderer's main thread (a runaway loop, a rAF that never settles) holds that
+                # thread indefinitely, and every CDP call that needs to run script then queues
+                # behind it and never returns - page.content, the xPath scraper, the favicon
+                # fetcher. The fetch dies at PUPPETEER_MAX_PROCESSING_TIMEOUT_SECONDS having
+                # extracted nothing, with a core spinning the entire time.
+                #
+                # Nothing else recovers this. Runtime.evaluate's own `timeout` parameter bounds an
+                # evaluation once it starts, not time spent queued behind the running task, and
+                # wrapping the call in asyncio.wait_for is worse than useless: cancelling a
+                # pyppeteer request mid-flight leaves the connection unusable ("Target closed" on
+                # everything after it). Terminating execution is what releases the thread -
+                # measured against a deliberately spinning page, extraction went from timing out
+                # to returning the full DOM in 0.0s and the renderer dropped from 1.00 to 0.08
+                # cores. Safe here because stopLoading has already declared "give me what
+                # rendered", and the content-ready wait above has already had its chance to let
+                # late JS-rendered content appear.
+                await self.page._client.send('Runtime.terminateExecution')
+                logger.debug("Runtime.terminateExecution sent, any runaway page script is stopped")
+            except Exception as e:
+                logger.debug(f"Page.stopLoading/Runtime.terminateExecution skipped, page is most "
+                             f"likely already gone: {e}")
+
+        # Track the LATEST main-frame document response for the whole fetch, not just the one that
+        # goto() happens to return. This app compares the text of the page the browser ends up on,
+        # and plenty of sites navigate again after the first response:
+        #  - an interstitial answering 503/429 with a meta-refresh into the real 200 page, where
+        #    judging the first response fails a watch whose content is sitting right there
+        #  - a plain client-side redirect to another host (slated.com -> get.slated.com)
+        # It also covers Chrome 153+, which refuses to commit a navigation when an error status
+        # arrives with a zero-length body: goto() raises net::ERR_HTTP_RESPONSE_CODE_FAILURE rather
+        # than returning the response, but the response itself still arrives on this event.
+        navigation_response = {}
+
+        def _keep_navigation_response(response):
+            # Note pyppeteer exposes these as properties, unlike playwright where they are methods
+            if response.frame == self.page.mainFrame and response.request.isNavigationRequest:
+                navigation_response['response'] = response
+
+        self.page.on('response', _keep_navigation_response)
+
+        # Chrome hands a PDF straight to its built-in viewer, after which page.content and
+        # Network.getResponseBody both only give the viewer's HTML, never the PDF. Pause each
+        # document response once its headers arrive (we can't know beforehand that it's a PDF),
+        # and if it is a PDF copy the body out of the paused response - no second download.
+        main_frame_pdf = {}
+
+        async def _handle_document_response(event):
+            try:
+                # Request-stage pauses only exist when proxy auth is on (see the Fetch.enable below), nothing to inspect
+                if 'responseStatusCode' not in event and 'responseErrorReason' not in event:
+                    return
+                if event.get('frameId') != self.page.mainFrame._id:
+                    return
+                # Any new main-frame document replaces whatever was captured before
+                main_frame_pdf.pop('body', None)
+                content_type = next((h.get('value', '') for h in event.get('responseHeaders') or []
+                                     if h.get('name', '').lower() == 'content-type'), '')
+                if 'application/pdf' not in content_type.lower():
+                    return
+                r = await self.page._client.send('Fetch.getResponseBody', {'requestId': event['requestId']})
+                main_frame_pdf['body'] = base64.b64decode(r['body']) if r.get('base64Encoded') else r['body'].encode('utf-8')
+                logger.debug(f"Captured PDF body ({len(main_frame_pdf['body'])} bytes) for {event['request']['url']}")
+            except Exception as e:
+                logger.warning(f"Could not capture the PDF response body: {e}")
+            finally:
+                # Every paused request MUST be continued, otherwise the page hangs
+                try:
+                    await self.page._client.send('Fetch.continueRequest', {'requestId': event['requestId']})
+                except Exception as e:
+                    logger.debug(f"Fetch.continueRequest failed, page is most likely already gone: {e}")
+
+        def _on_request_paused(event):
+            asyncio.ensure_future(_handle_document_response(event))
+
+        # Fetch.enable REPLACES any earlier Fetch.enable, including the one page.authenticate() did for
+        # proxy credentials ({'handleAuthRequests': True, 'patterns': [{'urlPattern': '*'}]}), without
+        # handleAuthRequests Chrome never asks for the credentials and the proxy answers 407.
+        proxy_auth = bool(self.proxy and self.proxy.get('username'))
+        fetch_patterns = [{'resourceType': 'Document', 'requestStage': 'Response'}]
+        if proxy_auth:
+            # Every request (not just documents) must be matched for Chrome to emit Fetch.authRequired for it
+            fetch_patterns.append({'urlPattern': '*', 'requestStage': 'Request'})
+            # pyppeteer's NetworkManager still answers Fetch.authRequired with the credentials, but stop it from
+            # blindly continuing every paused request, it would continue our paused PDF responses before we copy
+            # the body out. _handle_document_response continues everything itself.
+            self.page._frameManager.networkManager._protocolRequestInterceptionEnabled = False
+
+        self.page._client.on('Fetch.requestPaused', _on_request_paused)
+        await self.page._client.send('Fetch.enable', {'handleAuthRequests': proxy_auth, 'patterns': fetch_patterns})
+
+        # pyppeteer's navigation watcher is bound to the loaderId of the navigation it started. If
+        # the page replaces that document (redirect/interstitial) the 'load' it waits for never
+        # arrives for that loaderId, so goto() never returns - and with timeout=0 it would block
+        # until the hard PUPPETEER_MAX_PROCESSING_TIMEOUT_SECONDS kill, burning a worker slot for
+        # minutes on a page that is fully loaded. Bound it, then fall back to the document we can
+        # see. Verified against slated.com and getastra.com, which hang indefinitely otherwise.
+        nav_timeout = int(os.getenv("BROWSER_NAVIGATION_TIMEOUT_SECONDS", 30))
+
+        response = None
+        attempt=0
+        try:
+            while not response:
+                logger.debug(f"Attempting page fetch {url} attempt {attempt}")
+                # Race goto() against the main frame actually firing 'load'. In the re-navigation
+                # case goto() can never resolve, but the replacement document does fire 'load' -
+                # usually within a few seconds - so this returns then instead of sitting out the
+                # whole nav_timeout. Whichever arrives first means "the document is loaded".
+                main_frame_loaded = asyncio.Event()
+                main_frame_id = self.page.mainFrame._id
+
+                def _on_lifecycle(event):
+                    if event.get('name') == 'load' and event.get('frameId') == main_frame_id:
+                        main_frame_loaded.set()
+
+                self.page._client.on('Page.lifecycleEvent', _on_lifecycle)
+                goto_task = asyncio.ensure_future(self.page.goto(url, timeout=0))
+                load_task = asyncio.ensure_future(main_frame_loaded.wait())
+                try:
+                    done, _pending = await asyncio.wait({goto_task, load_task},
+                                                        timeout=nav_timeout,
+                                                        return_when=asyncio.FIRST_COMPLETED)
+
+                    if goto_task in done:
+                        try:
+                            response = goto_task.result()
+                        except Exception as e:
+                            if 'ERR_HTTP_RESPONSE_CODE_FAILURE' not in str(e) or not navigation_response:
+                                raise
+                            response = navigation_response['response']
+                            logger.debug(f"Navigation was aborted by the browser (empty body on an error status), "
+                                         f"recovered status {response.status} from the response event")
+                    else:
+                        # Either the replacement document loaded, or we ran out of patience
+                        response = navigation_response.get('response')
+                        if not response:
+                            raise BrowserFetchTimedOut(msg=f"Browser did not finish navigating to {url} within "
+                                                           f"{nav_timeout}s and no main-frame response was seen.")
+                        why = ("the page replaced the document it started on" if load_task in done
+                               else f"navigation did not settle within {nav_timeout}s")
+                        logger.warning(f"Continuing with the document actually loaded ({why}) - "
+                                       f"status {response.status} for {response.url}")
+                finally:
+                    self.page._client.remove_listener('Page.lifecycleEvent', _on_lifecycle)
+                    for t in (goto_task, load_task):
+                        if not t.done():
+                            t.cancel()
+                if response:
+                    break
+                if not response:
+                    logger.warning("Page did not fetch! trying again!")
+                if response is None and attempt>=2:
+                    logger.warning(f"Content Fetcher > Response object was none (as in, the response from the browser was empty, not just the content) exiting attempt {attempt}")
+                    raise EmptyReply(url=url, status_code=None)
+                attempt+=1
+
+            # Navigation is done; now honour "wait n seconds before extracting text" and then
+            # force-stop whatever is still loading, so extraction always gets what rendered.
+            # Awaited inline rather than fired off as a task, so nothing can outlive the fetch.
+            await wait_for_content_ready_then_stop_loading()
+
+            # That wait is where a meta-refresh interstitial typically swaps in the real page, so
+            # re-check which document we are actually on before judging the status code.
+            latest = navigation_response.get('response')
+            if latest is not None and latest is not response:
+                logger.debug(f"Page navigated again while waiting, judging the fetch on {latest.url} "
+                             f"(status {latest.status}) instead of {response.url} (status {response.status})")
+                response = latest
+        finally:
+            self.page.remove_listener('response', _keep_navigation_response)
+            self.page._client.remove_listener('Fetch.requestPaused', _on_request_paused)
+            try:
+                if proxy_auth:
+                    # Hand Fetch back to pyppeteer as page.authenticate() left it, so later requests still get the credentials
+                    await self.page.authenticate(self.proxy)
+                else:
+                    await self.page._client.send('Fetch.disable')
+            except Exception as e:
+                logger.debug(f"Resetting Fetch failed, page is most likely already gone: {e}")
+
+        self.headers = response.headers
+
+        try:
+            if self.webdriver_js_execute_code is not None and len(self.webdriver_js_execute_code):
+                await self.page.evaluate(self.webdriver_js_execute_code)
+        except Exception as e:
+            logger.warning("Got exception when running evaluate on custom JS code")
+            logger.error(str(e))
+            # This can be ok, we will try to grab what we could retrieve
+            raise PageUnloadable(url=url, status_code=None, message=str(e))
+
+        try:
+            self.status_code = response.status
+        except Exception as e:
+            # https://github.com/dgtlmoon/changedetection.io/discussions/2122#discussioncomment-8241962
+            logger.critical(f"Response from the browser/Playwright did not have a status_code! Response follows.")
+            logger.critical(response)
+            raise PageUnloadable(url=url, status_code=None, message=str(e))
+
+        if fetch_favicon:
+            try:
+                self.favicon_blob = await self.page.evaluate(FAVICON_FETCHER_JS)
+            except Exception as e:
+                logger.error(f"Error fetching FavIcon info {str(e)}, continuing.")
+
+        if self.status_code != 200 and not ignore_status_codes:
+            screenshot = await capture_full_page(page=self.page, screenshot_format=self.screenshot_format, watch_uuid=watch_uuid, lock_viewport_elements=self.lock_viewport_elements)
+
+            raise Non200ErrorCodeReceived(url=url, status_code=self.status_code, screenshot=screenshot)
+
+        content = await self.page.content
+
+        if not empty_pages_are_a_change and len(content.strip()) == 0:
+            logger.error("Content Fetcher > Content was empty (empty_pages_are_a_change is False), closing browsers")
+            raise EmptyReply(url=url, status_code=response.status)
+
+        # Run Browser Steps here
+        # @todo not yet supported, we switch to playwright in this case
+        #            if self.browser_steps:
+        #                self.iterate_browser_steps()
+
+
+        # So we can find an element on the page where its selector was entered manually (maybe not xPath etc)
+        # Setup the xPath/VisualSelector scraper
+        if current_include_filters:
+            js = json.dumps(current_include_filters)
+            await self.page.evaluate(f"var include_filters={js}")
+        else:
+            await self.page.evaluate(f"var include_filters=''")
+
+        MAX_TOTAL_HEIGHT = int(os.getenv("SCREENSHOT_MAX_HEIGHT", SCREENSHOT_MAX_HEIGHT_DEFAULT))
+
+        pdf_body = main_frame_pdf.get('body')
+        if pdf_body and 'application/pdf' in (response.headers.get('content-type') or '').lower():
+            # Same as the requests fetcher does for binary files, the processor converts raw_content
+            self.content = hashlib.md5(pdf_body).hexdigest()
+            self.raw_content = pdf_body
+        else:
+            self.content = await self.page.content
+
+        # Now take screenshot (scrolling may trigger layout changes, but measurements are already captured)
+        logger.debug(f"Screenshot format {self.screenshot_format}")
+        self.screenshot = await capture_full_page(page=self.page, screenshot_format=self.screenshot_format, watch_uuid=watch_uuid, lock_viewport_elements=self.lock_viewport_elements)
+
+        # Force garbage collection - pyppeteer base64 decode creates temporary buffers
+        gc_debounce.collect('puppeteer.after_screenshot')
+        self.xpath_data = await self.page.evaluate(XPATH_ELEMENT_JS, {
+            "visualselector_xpath_selectors": visualselector_xpath_selectors,
+            "max_height": MAX_TOTAL_HEIGHT
+        })
+        if not self.xpath_data:
+            raise Exception(f"Content Fetcher > xPath scraper failed. Please report this URL so we can fix it :)")
+
+
+        self.instock_data = await self.page.evaluate(INSTOCK_DATA_JS)
+
+        # It's good to log here in the case that the browser crashes on shutting down but we still get the data we need
+        logger.success(f"Fetching '{url}' complete, exiting puppeteer fetch.")
+
+    async def main(self, **kwargs):
+        await self.fetch_page(**kwargs)
+
+    async def run(self,
+                  fetch_favicon=True,
+                  current_include_filters=None,
+                  empty_pages_are_a_change=False,
+                  ignore_status_codes=False,
+                  is_binary=False,
+                  request_body=None,
+                  request_headers=None,
+                  request_method=None,
+                  screenshot_format=None,
+                  timeout=None,
+                  url=None,
+                  watch_uuid=None,
+                  ):
+
+        #@todo make update_worker async which could run any of these content_fetchers within memory and time constraints
+        max_time = int(os.getenv('PUPPETEER_MAX_PROCESSING_TIMEOUT_SECONDS', 180))
+
+        # Now we run this properly in async context since we're called from async worker
+        try:
+            await asyncio.wait_for(self.main(
+                current_include_filters=current_include_filters,
+                empty_pages_are_a_change=empty_pages_are_a_change,
+                fetch_favicon=fetch_favicon,
+                ignore_status_codes=ignore_status_codes,
+                is_binary=is_binary,
+                request_body=request_body,
+                request_headers=request_headers,
+                request_method=request_method,
+                screenshot_format=None,
+                timeout=timeout,
+                url=url,
+                watch_uuid=watch_uuid,
+            ), timeout=max_time
+            )
+        except asyncio.TimeoutError:
+            raise (BrowserFetchTimedOut(msg=f"Browser connected but was unable to process the page in {max_time} seconds."))
+        finally:
+            # Nothing consumes page_errors yet, but a crashed renderer usually means the content we
+            # just extracted is partial or stale, so always say so - otherwise the only clue is a
+            # confusing downstream error (or worse, a silently wrong "change detected").
+            if self.page_errors:
+                logger.warning(
+                    f"[{watch_uuid}] {len(self.page_errors)} page error(s) during this fetch of '{url}', "
+                    f"content may be incomplete: {'; '.join(str(e) for e in self.page_errors)}"
+                )
+
+            # Internal cleanup on any exception/timeout - call quit() immediately
+            # This prevents connection leaks during exception bursts
+            # Worker.py's quit() call becomes a redundant safety net (idempotent)
+            try:
+                await self.quit(watch={'uuid': watch_uuid} if watch_uuid else None)
+            except Exception as cleanup_error:
+                logger.error(f"[{watch_uuid}] Error during internal quit() cleanup: {cleanup_error}")
+
+
+# Plugin registration for built-in fetcher
+class PuppeteerFetcherPlugin:
+    """Plugin class that registers the Puppeteer fetcher as a built-in plugin."""
+
+    def register_content_fetcher(self):
+        """Register the Puppeteer fetcher"""
+        return ('html_webdriver', fetcher)
+
+
+# Create module-level instance for plugin registration
+puppeteer_plugin = PuppeteerFetcherPlugin()

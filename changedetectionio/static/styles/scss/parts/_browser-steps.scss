@@ -1,0 +1,120 @@
+
+#browser_steps {
+  /* convert rows to horizontal cells */
+  th {
+    display: none;
+  }
+
+  li {
+    &.browser-step-with-error {
+      background-color: #ffd6d6;
+      border-radius: 4px;
+    }
+    &:not(:first-child) {
+      &:hover {
+        opacity: 1.0;
+      }
+    }
+    list-style: decimal;
+    padding: 5px;
+    .control {
+      padding-left: 5px;
+      padding-right: 5px;
+      a {
+        font-size: 70%;
+      }
+    }
+    &.empty {
+      padding: 0px;
+      opacity: 0.35;
+      .control {
+        display: none;
+      }
+    }
+    &:hover {
+      background: #eee;
+    }
+    > label {
+      display: none;
+    }
+  }
+}
+
+@media only screen and (min-width: 760px) {
+
+  #browser-steps .flex-wrapper {
+    display: flex;
+    flex-flow: row;
+    height: 70vh;
+    font-size: 80%;
+
+    #browser-steps-ui {
+      flex-grow: 1; /* Allow it to grow and fill the available space */
+      flex-shrink: 1; /* Allow it to shrink if needed */
+      flex-basis: 0; /* Start with 0 base width so it stretches as much as possible */
+      background-color: #eee;
+      border-radius: 5px;
+
+    }
+  }
+
+  #browser-steps-fieldlist {
+    flex-grow: 0;      /* Don't allow it to grow */
+    flex-shrink: 0;    /* Don't allow it to shrink */
+    flex-basis: auto;  /* Base width is determined by the content */
+    max-width: 400px;  /* Set a max width to prevent overflow */
+    padding-left: 1rem;
+    overflow-y: scroll;
+  }
+
+  /*  this is duplicate :( */
+  #browsersteps-selector-wrapper {
+    height: 100% !important;
+  }
+}
+
+/*  this is duplicate :( */
+#browsersteps-selector-wrapper {
+
+  width: 100%;
+  overflow-y: scroll;
+  position: relative;
+
+  > img {
+    position: absolute;
+    max-width: 100%;
+  }
+
+  > canvas {
+    position: relative;
+    max-width: 100%;
+
+    &:hover {
+      cursor: pointer;
+    }
+  }
+
+  .loader {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 100;
+    max-width: 350px;
+    text-align: center;
+  }
+
+  /* nice tall skinny one */
+  .spinner, .spinner:after {
+    width: 80px;
+    height: 80px;
+    font-size: 3px;
+  }
+
+  #browsersteps-click-start {
+    &:hover {
+      cursor: pointer;
+    }
+    color: var(--color-grey-400);
+  }
+}

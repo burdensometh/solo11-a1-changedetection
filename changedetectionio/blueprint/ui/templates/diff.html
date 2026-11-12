@@ -1,0 +1,251 @@
+{% extends 'base.html' %}
+{% from '_helpers.html' import render_field, render_checkbox_field, render_button %}
+{% block content %}
+<script>
+    const screenshot_url="{{url_for('static_content', group='screenshot', filename=uuid)}}";
+    {% if last_error_screenshot %}
+    const error_screenshot_url="{{url_for('static_content', group='screenshot', filename=uuid, error_screenshot=1) }}";
+    {% endif %}
+
+    const highlight_submit_ignore_url="{{url_for('ui.ui_edit.highlight_submit_ignore_url', uuid=uuid)}}";
+    const watch_url= {{watch_a.open_link|tojson}};
+
+    // Initial scroll position: if set, scroll to this line number in #difference on page load
+    const initialScrollToLineNumber = {{ initial_scroll_line_number|default('null') }};
+</script>
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script src="{{url_for('static_content', group='js', filename='plugins.js')}}"></script>
+<script src="https://cdn.jsdelivr.net/npm/piexifjs@1.0.6/piexif.min.js"></script>
+<script src="{{url_for('static_content', group='js', filename='snippet-to-image.js')}}"></script>
+<script src="{{url_for('static_content', group='js', filename='diff-overview.js')}}" defer></script>
+<script src="{{url_for('static_content', group='js', filename='llm-summary.js')}}" defer></script>
+
+
+<div id="diff-header">
+<div id="settings">
+    <form class="pure-form " action="{{ url_for("ui.ui_diff.diff_history_page", uuid=uuid) }}" method="GET" id="diff-form">
+        <fieldset class="diff-fieldset">
+            {% if versions|length >= 1 %}
+                <span style="white-space: nowrap;">
+                {# TRANSLATORS: 'From' labels the older snapshot version selector on the diff page #}
+                <label id="change-from" for="diff-from-version" class="from-to-label">{{ pgettext('diff version', 'From') }}</label>
+                <select id="diff-from-version" name="from_version" class="needs-localtime">
+                    {%- for version in versions|reverse -%}
+                        <option value="{{ version }}" {% if version== from_version %} selected="" {% endif %}>
+                            {{ version }}{#{% if loop.index == 2 %} (Previous){% endif %}#}
+                        </option>
+                    {%- endfor -%}
+                </select>
+                </span>
+                <span style="white-space: nowrap;">
+                {# TRANSLATORS: 'To' labels the newer snapshot version selector on the diff page #}
+                <label id="change-to" for="diff-to-version" class="from-to-label">{{ pgettext('diff version', 'To') }}</label>
+                <select id="diff-to-version" name="to_version" class="needs-localtime">
+                    {%- for version in versions|reverse -%}
+                        <option value="{{ version }}" {% if version== to_version %} selected="" {% endif %}>
+                            {{ version }}{#{% if loop.first %} (Current){% endif %}#}
+                        </option>
+                    {%- endfor -%}
+                </select>
+                </span>
+                {#<button type="submit" class="pure-button pure-button-primary reset-margin">Go</button>#}
+            {% endif %}
+        </fieldset>
+        {# Collapses the diff options below into a popover. Hidden until
+           diff-overview.js takes over the fieldset, so with scripting off the
+           options stay inline and reachable. #}
+        <button type="button" id="diff-filters-toggle" class="pure-button" aria-expanded="false" aria-controls="diff-style">{{ _('Filters') }} &#x25be;</button>
+        <fieldset id="diff-style">
+            <span>
+                <label for="diffWords" class="pure-checkbox">
+                <input type="radio" name="type" id="diffWords" value="diffWords" {% if diff_prefs.type == 'diffWords' %}checked=""{% endif %}> {{ _('Words') }}</label>
+            </span>
+            <span>
+                <label for="diffLines" class="pure-checkbox">
+                <input type="radio" name="type" id="diffLines" value="diffLines" {% if diff_prefs.type == 'diffLines' %}checked=""{% endif %}> {{ _('Lines') }}</label>
+            </span>
+            <span>
+                <label for="ignoreWhitespace" class="pure-checkbox" id="label-diff-ignorewhitespace">
+                <input type="checkbox" id="ignoreWhitespace" name="ignoreWhitespace" {% if diff_prefs.ignoreWhitespace %}checked=""{% endif %}> {{ _('Ignore Whitespace') }}</label>
+            </span>
+            <span>
+                <label for="changesOnly" class="pure-checkbox" id="label-diff-changes">
+                <input type="checkbox" id="changesOnly" name="changesOnly" {% if diff_prefs.changesOnly %}checked=""{% endif %}> {{ _('Same/non-changed') }}</label>
+            </span>
+            {# TRANSLATORS: 'Removed' is a noun label for a diff display filter (toggles removed lines), not a verb phrase or status badge #}
+            <span>
+                <label for="removed" class="pure-checkbox" id="label-diff-removed">
+                <input type="checkbox" id="removed" name="removed" {% if diff_prefs.removed %}checked=""{% endif %}> {{ pgettext('diff filter', 'Removed') }}</label>
+            </span>
+            {# TRANSLATORS: 'Added' is a noun label for a diff display filter (toggles added lines), not a verb phrase or status badge #}
+            <span>
+                <label for="added" class="pure-checkbox" id="label-diff-added">
+                <input type="checkbox" id="added" name="added" {% if diff_prefs.added %}checked=""{% endif %}> {{ pgettext('diff filter', 'Added') }}</label>
+            </span>
+            {# TRANSLATORS: 'Replaced' is a noun label for a diff display filter (toggles replaced lines), not a verb phrase or status badge #}
+            <span>
+                <label for="replaced" class="pure-checkbox" id="label-diff-replaced">
+                <input type="checkbox" id="replaced"  name="replaced" {% if diff_prefs.replaced %}checked=""{% endif %}> {{ pgettext('diff filter', 'Replaced') }}</label>
+            </span>
+            {%- if llm_configured -%}
+            <span>
+                <label for="llm_all_changes" class="pure-checkbox" id="label-diff-llm-all-changes" title="{{ _('Include all intermediate snapshots between the selected versions in the AI summary') }}">
+                <input type="checkbox" id="llm_all_changes" name="llm_all_changes" {% if diff_prefs.llm_all_changes %}checked=""{% endif %}> &#x2728; {{ _('AI: every change between versions') }}</label>
+            </span>
+            {%- endif -%}
+        </fieldset>
+        {%- if versions|length >= 2 -%}
+            <div id="keyboard-nav">
+                {# In the sticky bar the prompt and the two words are hidden and
+                   only the arrows show, so each link repeats its label as the
+                   accessible name and the tooltip - without them a screen reader
+                   is left reading the arrow glyph itself. #}
+                <strong>{{ _('Keyboard:') }} </strong>
+                <a href="" class="pure-button pure-button-primary" id="btn-previous" title="{{ _('Previous') }}" aria-label="{{ _('Previous') }}"> &larr; <span class="keyboard-nav-label">{{ _('Previous') }}</span></a>
+                <a class="pure-button pure-button-primary" id="btn-next" href="" title="{{ _('Next') }}" aria-label="{{ _('Next') }}"> &rarr; <span class="keyboard-nav-label">{{ _('Next') }}</span></a>
+            </div>
+        {%- endif -%}
+    </form>
+</div>
+
+<div id="diff-jump" style="display:none;"><!-- disabled for now -->
+    <a id="jump-next-diff" title="{{ _('Jump to next difference') }}">{{ _('Jump') }}</a>
+</div>
+
+<script src="{{url_for('static_content', group='js', filename='tabs.js')}}" defer></script>
+<div class="tabs">
+    <ul>
+        {% if last_error_text %}<li class="tab" id="error-text-tab"><a href="#error-text">{{ _('Error Text') }}</a></li> {% endif %}
+        {% if last_error_screenshot %}<li class="tab" id="error-screenshot-tab"><a href="#error-screenshot">{{ _('Error Screenshot') }}</a></li> {% endif %}
+        <li class="tab" id="text-tab"><a href="#text">{{ _('Text') }}</a></li>
+        <li class="tab" id="screenshot-tab"><a href="#screenshot">{{ _('Screenshot') }}</a></li>
+        <li class="tab" id="extract-tab"><a href="{{ url_for('ui.ui_diff.diff_history_page_extract_GET', uuid=uuid)}}">{{ _('Extract Data') }}</a></li>
+    </ul>
+</div>
+
+</div>{# /diff-header #}
+
+<div id="diff-ui">
+    <div class="tab-pane-inner" id="error-text">
+        <div class="snapshot-age error">{{watch_a.error_text_ctime|format_seconds_ago}} {{ _('seconds ago.') }}</div>
+        <pre>
+            {{ last_error_text }}
+        </pre>
+    </div>
+
+    <div class="tab-pane-inner" id="error-screenshot">
+        <div class="snapshot-age error">{{watch_a.snapshot_error_screenshot_ctime|format_seconds_ago}} {{ _('seconds ago') }}</div>
+        <img id="error-screenshot-img"  style="max-width: 80%" alt="{{ _('Current error-ing screenshot from most recent request') }}" >
+    </div>
+
+    <div class="tab-pane-inner" id="text">
+    {%- if (content | default('')).split('\n') | length > 100 -%}
+        {# A minimap of where the differences are, not a timeline: without a name the
+           coloured cells read as timestamps and people expect a date on hover
+           (issue #4550). #}
+        <div id="cell-diff-jump-visualiser"  style="user-select: none;" role="img" title="{{ _('Where in the document the differences are, not when they happened') }}" aria-label="{{ _('Where in the document the differences are, not when they happened') }}">
+            {%- for cell in diff_cell_grid -%}
+            <div{% if cell.class %} class="{{ cell.class }}"{% endif %}></div>
+            {%- endfor -%}
+        </div>
+    {%- endif -%}
+        {%- if password_enabled_and_share_is_off -%}
+            <div class="tip">{{ _('Pro-tip: You can enable <strong>"share access when password is enabled"</strong> from settings.')|safe }}
+            </div>
+        {%- endif -%}
+        {%- if llm_configured -%}
+        <div id="llm-diff-summary-area"{% if not llm_diff_summary %} data-pending="1"{% endif %}>
+            <span class="llm-diff-summary-label">&#x2728; {{ _('AI Change Summary') }}</span>
+            {%- if llm_diff_summary -%}
+            <p class="llm-diff-summary-text">{{ llm_diff_summary }}</p>
+            {%- else -%}
+            <p class="llm-diff-summary-text llm-diff-summary-loading">{{ _('Generating change summary…') }}</p>
+            {%- if llm_summary_prompt -%}
+            <p class="llm-diff-summary-prompt"><span class="llm-diff-summary-prompt-text">{{ llm_summary_prompt }}</span></p>
+            {%- endif -%}
+            {%- endif -%}
+        </div>
+        {%- endif -%}
+        <div id="text-diff-heading-area"  style="user-select: none;">
+            <div class="snapshot-age"><span>{{ from_version|format_timestamp_timeago }}</span>
+                {%- if note -%}<span class="note"><strong>{{ note }}</strong></span>{%- endif -%}
+                <a href="{{ url_for("ui.ui_preview.preview_page", uuid=uuid) }}">{{ _('Goto single snapshot') }}</a>
+            </div>
+        </div>
+        <pre id="difference" style="border-left: 2px solid #ddd;">{{ content| diff_unescape_difference_spans }}</pre>
+    <div id="diff-visualiser-area-after" style="user-select: none;">
+        <strong>{{ _('Tip:') }}</strong> {{ _('Highlight text to share or add to ignore lists.') }}
+        &nbsp;&mdash;&nbsp;<a href="{{ url_for('ui.ui_diff.download_patch', uuid=uuid, from_version=from_version, to_version=to_version) }}" target="_blank" rel="noopener" style="font-size:0.85em;">{{ _('Download difference patch') }}</a>
+    </div>
+    </div>
+
+    <div class="tab-pane-inner" id="screenshot">
+         <div class="tip">
+             {{ _('For now, Differences are performed on text, not graphically, only the latest screenshot is available.') }}
+         </div>
+         {% if is_html_webdriver %}
+           {% if screenshot %}
+            <div class="snapshot-age">{{watch_a.snapshot_screenshot_ctime|format_timestamp_timeago}}</div>
+            <img style="max-width: 80%" id="screenshot-img" alt="{{ _('Current screenshot from most recent request') }}" >
+           {% else %}
+              {{ _('No screenshot available just yet! Try rechecking the page.') }}
+           {% endif %}
+         {% else %}
+           <strong>{{ _('Screenshot requires Playwright/WebDriver enabled') }}</strong>
+         {% endif %}
+     </div>
+
+</div>
+
+<script>
+    const newest_version_timestamp = {{newest_version_timestamp}};
+</script>
+<script src="{{url_for('static_content', group='js', filename='diff-render.js')}}"></script>
+
+{% if llm_configured %}
+<script>
+$(function () {
+    var $area = $('#llm-diff-summary-area');
+    if (!$area.length || !$area.data('pending')) return;
+
+    var fromVersion = $('#diff-from-version').val();
+    var toVersion   = $('#diff-to-version').val();
+    var summaryUrl  = "{{ url_for('ui.ui_diff.diff_llm_summary', uuid=uuid) }}";
+
+    function showLlmError(msg) {
+        $area.find('.llm-diff-summary-text')
+             .removeClass('llm-diff-summary-loading')
+             .addClass('llm-error')
+             .text(msg);
+        $area.removeAttr('data-pending');
+    }
+
+    var llmAllChanges      = $('#llm_all_changes').is(':checked')    ? 1 : 0;
+    var ignoreWhitespace   = $('#ignoreWhitespace').is(':checked')   ? 1 : 0;
+    var showRemoved        = $('#removed').is(':checked')            ? 1 : 0;
+    var showAdded          = $('#added').is(':checked')              ? 1 : 0;
+    window.llmSummary.fetch({
+        url:  summaryUrl,
+        uuid: "{{ uuid }}",
+        params: {
+            from_version:      fromVersion,
+            to_version:        toVersion,
+            all_changes:       llmAllChanges,
+            ignore_whitespace: ignoreWhitespace,
+            removed:           showRemoved,
+            added:             showAdded,
+        },
+        onDone: function (summary) {
+            $area.find('.llm-diff-summary-text')
+                 .removeClass('llm-diff-summary-loading')
+                 .text(summary);
+            $area.find('.llm-diff-summary-prompt').remove();
+            $area.removeAttr('data-pending');
+        },
+        onError: showLlmError,
+    });
+});
+</script>
+{% endif %}
+
+{% endblock %}

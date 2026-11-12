@@ -1,0 +1,206 @@
+from loguru import logger
+
+# Processor capabilities
+supports_visual_selector = True
+supports_browser_steps = True
+supports_text_filters_and_triggers = True
+supports_text_filters_and_triggers_elements = True
+supports_request_type = True
+
+
+
+def _task(watch, update_handler):
+    from changedetectionio.content_fetchers.exceptions import ReplyWithContentButNoText
+    from changedetectionio.processors.text_json_diff.processor import FilterNotFoundInResponse
+
+    text_after_filter = ''
+
+    try:
+        # The slow process (we run 2 of these in parallel)
+        # Always force reprocess for preview - we want to show the filtered content regardless of checksums
+        changed_detected, update_obj, text_after_filter = update_handler.run_changedetection(watch=watch, force_reprocess=True)
+    except FilterNotFoundInResponse as e:
+        text_after_filter = f"Filter not found in HTML: {str(e)}"
+    except ReplyWithContentButNoText as e:
+        text_after_filter = "Filter found but no text (empty result)"
+    except Exception as e:
+        text_after_filter = f"Error: {str(e)}"
+
+    if not text_after_filter.strip():
+        text_after_filter = 'Empty content'
+
+    # because run_changedetection always returns bytes due to saving the snapshots etc
+    text_after_filter = text_after_filter.decode('utf-8') if isinstance(text_after_filter, bytes) else text_after_filter
+
+    return text_after_filter
+
+
+def _compute_ignore_line_numbers_for_preview(text_pre_extract, ignore_patterns, extract_patterns):
+    """1-indexed output line numbers in the post-extract display that correspond
+    to input lines matching ignore_text patterns.
+
+    Needed because extract_text (#4138) transforms line content — e.g. "0.54.10"
+    becomes ".54.10" — so a substring match for "0.54.10" against the post-extract
+    text fails and the preview UI can no longer mark the line as ignored. We find
+    the ignored line numbers in the pre-extract text and replay extract_by_regex
+    line-by-line to map them forward.
+    """
+    from changedetectionio import html_tools
+    from changedetectionio.processors.text_json_diff.processor import ContentTransformer
+
+    if not text_pre_extract or not ignore_patterns:
+        return []
+
+    ignored_input_lines = set(
+        html_tools.strip_ignore_text(
+            content=text_pre_extract,
+            wordlist=ignore_patterns,
+            mode='line numbers'
+        )
+    )
+    if not ignored_input_lines:
+        return []
+
+    if not extract_patterns:
+        return sorted(ignored_input_lines)
+
+    # Replay extract_by_regex per-line. Each emitted match ends with exactly one
+    # '\n', so counting newlines tells us how many output lines this input produced.
+    output_line_counter = 0
+    result = []
+    for input_idx, line in enumerate(text_pre_extract.splitlines()):
+        is_ignored = (input_idx + 1) in ignored_input_lines
+        matches_in_line = ContentTransformer.extract_by_regex(line, extract_patterns).count('\n')
+        for _ in range(matches_in_line):
+            output_line_counter += 1
+            if is_ignored:
+                result.append(output_line_counter)
+
+    return result
+
+
+def prepare_filter_prevew(datastore, watch_uuid, form_data):
+    '''Used by @app.route("/edit/<uuid_str:uuid>/preview-rendered", methods=['POST'])'''
+    from changedetectionio import forms, html_tools
+    from changedetectionio.model.Watch import model as watch_model
+    from concurrent.futures import ThreadPoolExecutor
+    from copy import deepcopy
+    from flask import request
+    import brotli
+    import importlib
+    import os
+    import time
+    now = time.time()
+
+    text_after_filter = ''
+    text_before_filter = ''
+    text_pre_extract = ''
+    trigger_line_numbers = []
+    ignore_line_numbers = []
+    blocked_line_numbers = []
+
+    tmp_watch = deepcopy(datastore.data['watching'].get(watch_uuid))
+
+    if tmp_watch and tmp_watch.history and os.path.isdir(tmp_watch.data_dir):
+        # Splice in the temporary stuff from the form
+        form = forms.processor_text_json_diff_form(formdata=form_data if request.method == 'POST' else None,
+                                                   data=form_data
+                                                   )
+
+        # Only update vars that came in via the AJAX post
+        p = {k: v for k, v in form.data.items() if k in form_data.keys()}
+        tmp_watch.update(p)
+
+        # Apply llm_intent from form directly — it's not part of processor_text_json_diff_form
+        # but the AJAX sends all visible inputs, so it arrives in form_data
+        if hasattr(form_data, 'get') and 'llm_intent' in form_data:
+            tmp_watch['llm_intent'] = (form_data.get('llm_intent') or '').strip()
+
+        blank_watch_no_filters = watch_model(datastore_path=datastore.datastore_path, __datastore=datastore.data)
+        blank_watch_no_filters['url'] = tmp_watch.get('url')
+
+        latest_filename = next(reversed(tmp_watch.history))
+        html_fname = os.path.join(tmp_watch.data_dir, f"{latest_filename}.html.br")
+        with open(html_fname, 'rb') as f:
+            decompressed_data = brotli.decompress(f.read()).decode('utf-8') if html_fname.endswith('.br') else f.read().decode('utf-8')
+
+            # Just like a normal change detection except provide a fake "watch" object and dont call .call_browser()
+            processor_module = importlib.import_module("changedetectionio.processors.text_json_diff.processor")
+            update_handler = processor_module.perform_site_check(datastore=datastore,
+                                                                 watch_uuid=tmp_watch.get('uuid')  # probably not needed anymore anyway?
+                                                                 )
+            # Use the last loaded HTML as the input
+            update_handler.datastore = datastore
+            update_handler.fetcher.content = str(decompressed_data) # str() because playwright/puppeteer/requests return string
+            update_handler.fetcher.headers['content-type'] = tmp_watch.get('content-type')
+
+            # Process our watch with filters and the HTML from disk, and also a blank watch with no filters but also with the same HTML from disk.
+            # The third task runs with extract_text cleared so we can compute ignore_line_numbers
+            # against the pre-extract text (extract_text transforms lines so post-extract substring
+            # matching for ignore patterns would otherwise fail — see #4138 follow-up).
+            # Do this as parallel threads (not processes) to avoid pickle issues with Lock objects
+            tmp_watch_no_extract = deepcopy(tmp_watch)
+            tmp_watch_no_extract['extract_text'] = []
+            try:
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    future1 = executor.submit(_task, tmp_watch, update_handler)
+                    future2 = executor.submit(_task, blank_watch_no_filters, update_handler)
+                    future3 = executor.submit(_task, tmp_watch_no_extract, update_handler)
+
+                    text_after_filter = future1.result()
+                    text_before_filter = future2.result()
+                    text_pre_extract = future3.result()
+            except Exception as e:
+                x=1
+
+    try:
+        trigger_line_numbers = html_tools.strip_ignore_text(content=text_after_filter,
+                                                            wordlist=tmp_watch['trigger_text'],
+                                                            mode='line numbers'
+                                                            )
+    except Exception as e:
+        text_before_filter = f"Error: {str(e)}"
+
+    try:
+        text_to_ignore = tmp_watch.get('ignore_text', []) + datastore.data['settings']['application'].get('global_ignore_text', [])
+        ignore_line_numbers = _compute_ignore_line_numbers_for_preview(
+            text_pre_extract=text_pre_extract,
+            ignore_patterns=text_to_ignore,
+            extract_patterns=tmp_watch.get('extract_text', [])
+        )
+    except Exception as e:
+        text_before_filter = f"Error: {str(e)}"
+
+    try:
+        blocked_line_numbers = html_tools.strip_ignore_text(content=text_after_filter,
+                                                           wordlist=tmp_watch.get('text_should_not_be_present', []) + datastore.data['settings']['application'].get('text_should_not_be_present', []),
+                                                           mode='line numbers'
+                                                           )
+    except Exception as e:
+        text_before_filter = f"Error: {str(e)}"
+
+    # LLM preview extraction — asks the LLM to directly answer the intent
+    # against the current filtered content (no diff comparison).
+    # e.g. intent "how many articles?" → answer "30 articles listed"
+    # Results are NOT cached back to the real watch.
+    llm_evaluation = None
+    try:
+        from changedetectionio.llm.evaluator import preview_extract
+        if text_after_filter and text_after_filter.strip() not in ('', 'Empty content'):
+            llm_evaluation = preview_extract(tmp_watch, datastore, content=text_after_filter)
+    except Exception as e:
+        logger.warning(f"LLM preview evaluation failed for {watch_uuid}: {e}")
+
+    logger.trace(f"Parsed in {time.time() - now:.3f}s")
+
+    return ({
+        'after_filter': text_after_filter,
+        'before_filter': text_before_filter.decode('utf-8') if isinstance(text_before_filter, bytes) else text_before_filter,
+        'blocked_line_numbers': blocked_line_numbers,
+        'duration': time.time() - now,
+        'ignore_line_numbers': ignore_line_numbers,
+        'llm_evaluation': llm_evaluation,
+        'trigger_line_numbers': trigger_line_numbers,
+        })
+
+

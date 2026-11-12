@@ -1,0 +1,507 @@
+import os
+import re
+import threading
+
+from changedetectionio.favicon_utils import get_favicon_mime_type
+
+from . import auth
+from changedetectionio import queuedWatchMetaData, strtobool
+from changedetectionio import worker_pool
+from flask import request, make_response, send_from_directory
+from flask_restful import abort, Resource
+from loguru import logger
+import copy
+
+from . import validate_openapi_request, strip_internal_api_fields, get_processor_api_fields
+from ..notification import valid_notification_formats
+from ..notification.handler import newline_re
+
+
+def validate_time_schedule_limit(json_data):
+    """
+    Validate the optional timezone inside time_schedule_limit.
+
+    The edit form runs validateTimeZoneName on this field, but the API did not -
+    the OpenAPI schema for time_schedule_limit does not declare a `timezone`
+    property at all and does not set additionalProperties:false, so any string
+    passed straight through and was stored.
+
+    That matters because the scheduler resolves it with arrow.now(tz), which
+    raises on an unknown zone. Before the ticker thread was hardened, a single
+    authenticated PUT with a bogus timezone stopped scheduling for EVERY watch
+    on the instance. It is now contained to the one watch, but that watch would
+    still silently never be checked again, so reject it at the boundary.
+
+    Returns None if valid, or an error message string if invalid.
+    """
+    schedule = json_data.get('time_schedule_limit')
+    if not isinstance(schedule, dict):
+        return None
+
+    tz_name = schedule.get('timezone')
+    if not tz_name:
+        return None
+
+    if not isinstance(tz_name, str):
+        return "time_schedule_limit.timezone must be a string IANA timezone name, e.g. 'Europe/Berlin'."
+
+    from zoneinfo import available_timezones
+    if tz_name.strip() not in available_timezones():
+        return (f"time_schedule_limit.timezone '{tz_name}' is not a valid timezone name. "
+                f"Use an IANA name such as 'Europe/Berlin' or 'UTC'.")
+
+    return None
+
+
+def validate_jinja2_templates(json_data):
+    """
+    Reject broken Jinja2 in url, link_to_open, body and headers, the same check the edit form runs.
+
+    Without it a broken template saved through the API is only noticed at fetch time, and the watch
+    then fails on every check. Values that are not Jinja2 (e.g. URL-encoded JSON {%22) are not rendered.
+
+    Returns None if valid, or an error message string if invalid.
+    """
+    from changedetectionio.jinja2_custom.validate import validate_jinja2_fields
+    headers = json_data.get('headers')
+    errors = validate_jinja2_fields(url=json_data.get('url'),
+                                    link_to_open=json_data.get('link_to_open'),
+                                    body=json_data.get('body'),
+                                    headers=headers if isinstance(headers, dict) else None)
+    if errors:
+        return '; '.join(f"{field}: {error}" for field, error in errors.items())
+    return None
+
+
+class Watch(Resource):
+    def __init__(self, **kwargs):
+        # datastore is a black box dependency
+        self.datastore = kwargs['datastore']
+        self.update_q = kwargs['update_q']
+
+    # Get information about a single watch, excluding the history list (can be large)
+    # curl http://localhost:5000/api/v1/watch/<uuid_str:uuid>
+    # @todo - version2 - ?muted and ?paused should be able to be called together, return the watch struct not "OK"
+    # ?recheck=true
+    @auth.check_token
+    @validate_openapi_request('getWatch')
+    def get(self, uuid):
+        """Get information about a single watch, recheck, pause, or mute."""
+        # Get watch reference first (for pause/mute operations)
+        watch_obj = self.datastore.data['watching'].get(uuid)
+        if not watch_obj:
+            abort(404, message='No watch exists with the UUID of {}'.format(uuid))
+
+        # Create a dict copy for JSON response (with lock for thread safety)
+        # This is much faster than deepcopy and doesn't copy the datastore reference
+        # WARNING: dict() is a SHALLOW copy - nested dicts are shared with original!
+        # Only safe because we only ADD scalar properties (line 97-101), never modify nested dicts
+        # If you need to modify nested dicts, use: from copy import deepcopy; watch = deepcopy(dict(watch_obj))
+        with self.datastore.lock:
+            watch = dict(watch_obj)
+
+        if request.args.get('recheck'):
+            worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
+            return "OK", 200
+        if request.args.get('paused', '') == 'paused':
+            watch_obj.pause()
+            watch_obj.commit()
+            return "OK", 200
+        elif request.args.get('paused', '') == 'unpaused':
+            watch_obj.unpause()
+            watch_obj.commit()
+            return "OK", 200
+        if request.args.get('muted', '') == 'muted':
+            watch_obj.mute()
+            watch_obj.commit()
+            return "OK", 200
+        elif request.args.get('muted', '') == 'unmuted':
+            watch_obj.unmute()
+            watch_obj.commit()
+            return "OK", 200
+
+        # Return without history, get that via another API call
+        # Properties are not returned as a JSON, so add the required props manually
+        watch['history_n'] = watch_obj.history_n
+        # attr .last_changed will check for the last written text snapshot on change
+        watch['last_changed'] = watch_obj.last_changed
+        watch['viewed'] = watch_obj.viewed
+        watch['link'] = watch_obj.link
+        watch['open_link'] = watch_obj.open_link
+
+        # Never expose `__`-prefixed transient/internal fields (e.g. __check_status)
+        watch = strip_internal_api_fields(watch)
+
+        # Resolved processor config (tag override wins) and processor state, keyed by processor name
+        watch.update(get_processor_api_fields(watch_obj, self.datastore, context='get'))
+        return watch
+
+    @auth.check_token
+    @validate_openapi_request('deleteWatch')
+    def delete(self, uuid):
+        """Delete a watch and related history."""
+        if not self.datastore.data['watching'].get(uuid):
+            abort(400, message='No watch exists with the UUID of {}'.format(uuid))
+
+        self.datastore.delete(uuid)
+        return 'OK', 204
+
+    @auth.check_token
+    @validate_openapi_request('updateWatch')
+    def put(self, uuid):
+        """Update watch information."""
+        from changedetectionio.api.operations import ApiError, update_watch
+        if not self.datastore.data['watching'].get(uuid):
+            abort(404, message='No watch exists with the UUID of {}'.format(uuid))
+        try:
+            update_watch(self.datastore, uuid, request.json)
+        except ApiError as e:
+            return e.message, e.status
+        return "OK", 200
+
+
+class WatchHistory(Resource):
+    def __init__(self, **kwargs):
+        # datastore is a black box dependency
+        self.datastore = kwargs['datastore']
+
+    # Get a list of available history for a watch by UUID
+    # curl http://localhost:5000/api/v1/watch/<uuid_str:uuid>/history
+    @auth.check_token
+    @validate_openapi_request('getWatchHistory')
+    def get(self, uuid):
+        """Get a list of all historical snapshots available for a watch."""
+        watch = self.datastore.data['watching'].get(uuid)
+        if not watch:
+            abort(404, message='No watch exists with the UUID of {}'.format(uuid))
+        return watch.history, 200
+
+    # Delete all history/snapshots for a watch, but keep the watch itself
+    # curl -X DELETE http://localhost:5000/api/v1/watch/<uuid_str:uuid>/history
+    @auth.check_token
+    @validate_openapi_request('deleteWatchHistory')
+    def delete(self, uuid):
+        """Clear all snapshot history for a watch (the watch itself is kept)."""
+        if not self.datastore.data['watching'].get(uuid):
+            abort(404, message='No watch exists with the UUID of {}'.format(uuid))
+
+        # Same call as the UI "Clear history" button - wipes snapshots/screenshots and
+        # resets last_checked etc, while preserving the watch and its processor config
+        self.datastore.clear_watch_history(uuid)
+        return 'OK', 204
+
+
+class WatchSingleHistory(Resource):
+    def __init__(self, **kwargs):
+        # datastore is a black box dependency
+        self.datastore = kwargs['datastore']
+
+    @auth.check_token
+    @validate_openapi_request('getWatchSnapshot')
+    def get(self, uuid, timestamp):
+        """Get single snapshot from watch."""
+        watch = self.datastore.data['watching'].get(uuid)
+        if not watch:
+            abort(404, message=f"No watch exists with the UUID of {uuid}")
+
+        if not len(watch.history):
+            abort(404, message=f"Watch found but no history exists for the UUID {uuid}")
+
+        if timestamp == 'latest':
+            timestamp = list(watch.history.keys())[-1]
+
+        # Validate that the timestamp exists in history
+        if timestamp not in watch.history:
+            abort(404, message=f"No history snapshot found for timestamp '{timestamp}'")
+
+        if request.args.get('html'):
+            content = watch.get_fetched_html(timestamp)
+            if content:
+                # XSS mitigation (GHSA-cgj8-g98g-4p9x): this is an API endpoint, not a
+                # browser-rendered view. The bytes ARE HTML (that's what the caller asked
+                # for) but a programmatic client doesn't need text/html — and serving
+                # text/html lets attacker-planted <script> in a monitored site execute
+                # in our origin if someone opens the URL in a browser.
+                #
+                # text/plain + explicit utf-8 + nosniff = browser shows inert text,
+                # sniffing can't re-classify it as HTML, an absent charset can't be
+                # auto-detected as UTF-7 (an alternative XSS vector). API clients
+                # still get the raw bytes — they don't care about Content-Type.
+                response = make_response(content, 200)
+                response.headers['Content-Type'] = 'text/plain; charset=utf-8'
+                response.headers['X-Content-Type-Options'] = 'nosniff'
+                # Include the timestamp in the download name so downloading multiple
+                # snapshots doesn't collide. No extension — the stored bytes are
+                # "whatever the fetcher captured" (HTML, JSON, XML, text…), so
+                # claiming .html on the download would be a false content-type label
+                # for non-HTML watches. The user/curl can rename if needed.
+                # Strip to safe filename chars (timestamp is already validated as a
+                # watch.history key — this is defense in depth against header injection).
+                safe_ts = re.sub(r'[^0-9A-Za-z_-]', '', str(timestamp))[:32] or 'snapshot'
+                response.headers['Content-Disposition'] = f'attachment; filename="snapshot-{safe_ts}"'
+            else:
+                response = make_response("No content found", 404)
+                response.mimetype = "text/plain"
+        else:
+            content = watch.get_history_snapshot(timestamp=timestamp)
+            response = make_response(content, 200)
+            response.mimetype = "text/plain"
+
+        return response
+
+class WatchHistoryDiff(Resource):
+    """
+    Generate diff between two historical snapshots.
+
+    Note: This API endpoint currently returns text-based diffs and works best
+    with the text_json_diff processor. Future processor types (like image_diff,
+    restock_diff) may want to implement their own specialized API endpoints
+    for returning processor-specific data (e.g., price charts, image comparisons).
+
+    The web UI diff page (/diff/<uuid>) is processor-aware and delegates rendering
+    to processors/{type}/difference.py::render() for processor-specific visualizations.
+    """
+    def __init__(self, **kwargs):
+        # datastore is a black box dependency
+        self.datastore = kwargs['datastore']
+
+    @auth.check_token
+    @validate_openapi_request('getWatchHistoryDiff')
+    def get(self, uuid, from_timestamp, to_timestamp):
+        """Generate diff between two historical snapshots."""
+        from changedetectionio import diff
+        from changedetectionio.notification.handler import apply_service_tweaks
+
+        watch = self.datastore.data['watching'].get(uuid)
+        if not watch:
+            abort(404, message=f"No watch exists with the UUID of {uuid}")
+
+        if not len(watch.history):
+            abort(404, message=f"Watch found but no history exists for the UUID {uuid}")
+
+        history_keys = list(watch.history.keys())
+
+        # Handle 'latest' keyword for to_timestamp
+        if to_timestamp == 'latest':
+            to_timestamp = history_keys[-1]
+
+        # Handle 'previous' keyword for from_timestamp (second-most-recent)
+        if from_timestamp == 'previous':
+            if len(history_keys) < 2:
+                abort(404, message=f"Not enough history entries. Need at least 2 snapshots for 'previous'")
+            from_timestamp = history_keys[-2]
+
+        # Validate timestamps exist
+        if from_timestamp not in watch.history:
+            abort(404, message=f"From timestamp {from_timestamp} not found in watch history")
+        if to_timestamp not in watch.history:
+            abort(404, message=f"To timestamp {to_timestamp} not found in watch history")
+
+        # Get the format parameter (default to 'text')
+        output_format = request.args.get('format', 'text').lower()
+
+        # Validate format
+        if output_format not in valid_notification_formats.keys():
+            abort(400, message=f"Invalid format. Must be one of: {', '.join(valid_notification_formats.keys())}")
+
+        # Get the word_diff parameter (default to False - line-level mode)
+        word_diff = strtobool(request.args.get('word_diff', 'false'))
+
+        # Get the no_markup parameter (default to False)
+        no_markup = strtobool(request.args.get('no_markup', 'false'))
+
+        # Retrieve snapshot contents
+        from_version_file_contents = watch.get_history_snapshot(from_timestamp)
+        to_version_file_contents = watch.get_history_snapshot(to_timestamp)
+
+        # Get diff preferences from query parameters (matching UI preferences in DIFF_PREFERENCES_CONFIG)
+        # Support both 'type' (UI parameter) and 'word_diff' (API parameter) for backward compatibility
+        diff_type = request.args.get('type', 'diffLines')
+        if diff_type == 'diffWords':
+            word_diff = True
+
+        # Get boolean diff preferences with defaults from DIFF_PREFERENCES_CONFIG
+        changes_only = strtobool(request.args.get('changesOnly', 'false'))
+        ignore_whitespace = strtobool(request.args.get('ignoreWhitespace', 'false'))
+        include_removed = strtobool(request.args.get('removed', 'true'))
+        include_added = strtobool(request.args.get('added', 'true'))
+        include_replaced = strtobool(request.args.get('replaced', 'true'))
+
+        # Generate the diff with all preferences
+        content = diff.render_diff(
+            previous_version_file_contents=from_version_file_contents,
+            newest_version_file_contents=to_version_file_contents,
+            ignore_junk=ignore_whitespace,
+            include_equal=not changes_only,
+            include_removed=include_removed,
+            include_added=include_added,
+            include_replaced=include_replaced,
+            word_diff=word_diff,
+        )
+
+        # Skip formatting if no_markup is set
+        if no_markup:
+            mimetype = "text/plain"
+        else:
+            # Apply formatting based on the requested format
+            if output_format == 'htmlcolor':
+                from changedetectionio.notification.handler import apply_html_color_to_body
+                content = apply_html_color_to_body(n_body=content)
+                mimetype = "text/html"
+            else:
+                # Apply service tweaks for text/html formats
+                # Pass empty URL and title as they're not used for the placeholder replacement we need
+                _, content, _ = apply_service_tweaks(
+                    url='',
+                    n_body=content,
+                    n_title='',
+                    requested_output_format=output_format
+                )
+                mimetype = "text/html" if output_format == 'html' else "text/plain"
+
+            if 'html' in output_format:
+                content = newline_re.sub('<br>\r\n', content)
+
+        response = make_response(content, 200)
+        response.mimetype = mimetype
+        return response
+
+
+class WatchFavicon(Resource):
+    def __init__(self, **kwargs):
+        # datastore is a black box dependency
+        self.datastore = kwargs['datastore']
+
+    @auth.check_token
+    @validate_openapi_request('getWatchFavicon')
+    def get(self, uuid):
+        """Get favicon for a watch."""
+        watch = self.datastore.data['watching'].get(uuid)
+        if not watch:
+            abort(404, message=f"No watch exists with the UUID of {uuid}")
+
+        favicon_filename = watch.get_favicon_filename()
+        if favicon_filename:
+            # Use cached MIME type detection
+            filepath = os.path.join(watch.data_dir, favicon_filename)
+            mime = get_favicon_mime_type(filepath)
+            if 'text' in mime:
+                logger.debug(f"Aborting favicon request for {filepath} because mimetype might be text (bad mimetype) '{mime}'")
+                abort(404)
+
+            response = make_response(send_from_directory(watch.data_dir, favicon_filename))
+            response.headers['Content-type'] = mime
+            response.headers['Cache-Control'] = 'max-age=300, must-revalidate'  # Cache for 5 minutes, then revalidate
+            return response
+
+        abort(404, message=f'No Favicon available for {uuid}')
+
+
+class CreateWatch(Resource):
+    def __init__(self, **kwargs):
+        # datastore is a black box dependency
+        self.datastore = kwargs['datastore']
+        self.update_q = kwargs['update_q']
+
+    @auth.check_token
+    @validate_openapi_request('createWatch')
+    def post(self):
+        """Create a single watch."""
+        from changedetectionio.api.operations import ApiError, create_watch
+        try:
+            new_uuid = create_watch(self.datastore, request.get_json())
+        except ApiError as e:
+            return e.message, e.status
+        # Dont queue because the scheduler will check that it hasnt been checked before anyway
+        return {'uuid': new_uuid}, 201
+
+    @auth.check_token
+    @validate_openapi_request('listWatches')
+    def get(self):
+        """List watches."""
+        list = {}
+
+        tag_limit = request.args.get('tag', '').lower()
+        with_errors = request.args.get('with_errors') == '1'
+        for uuid, watch in self.datastore.data['watching'].items():
+            # Watch tags by name (replace the other calls?)
+            tags = self.datastore.get_all_tags_for_watch(uuid=uuid)
+            if tag_limit and not any(v.get('title').lower() == tag_limit for k, v in tags.items()):
+                continue
+            if with_errors and not watch.get('last_error'):
+                continue
+
+            list[uuid] = {
+                'last_changed': watch.last_changed,
+                'last_checked': watch['last_checked'],
+                'last_error': watch['last_error'],
+                'link': watch.link,
+                'notification_muted': bool(watch.get('notification_muted')),
+                'open_link': watch.open_link,
+                'page_title': watch['page_title'],
+                'paused': bool(watch.get('paused')),
+                'processor': watch.get('processor') or 'text_json_diff',
+                'tags': [*tags],  # Unpack dict keys to list (can't use list() since variable named 'list')
+                'title': watch['title'],
+                'url': watch['url'],
+                'viewed': watch.viewed
+            }
+            # processor_state_{name} only, the processor config is a disk read so it stays on the single watch GET
+            list[uuid].update(get_processor_api_fields(watch, self.datastore, context='list'))
+
+        if request.args.get('recheck_all'):
+            # Recheck the same set that was listed (tag/with_errors filters), but never paused watches
+            watches_to_queue = [uuid for uuid in list.keys() if not self.datastore.data['watching'][uuid].get('paused')]
+
+            # If less than 20 watches, queue synchronously for immediate feedback
+            if len(watches_to_queue) < 20:
+                # Get already queued/running UUIDs once (efficient)
+                queued_uuids = set(self.update_q.get_queued_uuids())
+                running_uuids = set(worker_pool.get_running_uuids())
+
+                # Filter out watches that are already queued or running
+                watches_to_queue_filtered = [
+                    uuid for uuid in watches_to_queue
+                    if uuid not in queued_uuids and uuid not in running_uuids
+                ]
+
+                # Queue only the filtered watches
+                for uuid in watches_to_queue_filtered:
+                    worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
+
+                # Provide feedback about skipped watches
+                skipped_count = len(watches_to_queue) - len(watches_to_queue_filtered)
+                if skipped_count > 0:
+                    return {'status': f'OK, queued {len(watches_to_queue_filtered)} watches for rechecking ({skipped_count} already queued or running)'}, 200
+                else:
+                    return {'status': f'OK, queued {len(watches_to_queue_filtered)} watches for rechecking'}, 200
+            else:
+                # 20+ watches - queue in background thread to avoid blocking API response
+                # Capture queued/running state before background thread
+                queued_uuids = set(self.update_q.get_queued_uuids())
+                running_uuids = set(worker_pool.get_running_uuids())
+
+                def queue_all_watches_background():
+                    """Background thread to queue all watches - discarded after completion."""
+                    try:
+                        queued_count = 0
+                        skipped_count = 0
+                        for uuid in watches_to_queue:
+                            # Check if already queued or running (state captured at start)
+                            if uuid not in queued_uuids and uuid not in running_uuids:
+                                worker_pool.queue_item_async_safe(self.update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
+                                queued_count += 1
+                            else:
+                                skipped_count += 1
+
+                        logger.info(f"Background queueing complete: {queued_count} watches queued, {skipped_count} skipped (already queued/running)")
+                    except Exception as e:
+                        logger.error(f"Error in background queueing all watches: {e}")
+
+                # Start background thread and return immediately
+                thread = threading.Thread(target=queue_all_watches_background, daemon=True, name="QueueAllWatches-Background")
+                thread.start()
+
+                return {'status': f'OK, queueing {len(watches_to_queue)} watches in background'}, 202
+
+        return list, 200

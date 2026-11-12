@@ -1,0 +1,154 @@
+{% extends 'base.html' %}
+{% block content %}
+{% from '_helpers.html' import render_field, render_checkbox_field, render_button, render_ternary_field %}
+{% from '_common_fields.html' import render_common_settings_form %}
+<script>
+    const notification_base_url="{{url_for('ui.ui_notification.ajax_callback_send_notification_test', mode="group-settings")}}";
+</script>
+
+<script src="{{url_for('static_content', group='js', filename='tabs.js')}}" defer></script>
+<script>
+
+/*{% if emailprefix %}*/
+    /*const email_notification_prefix=JSON.parse('{{ emailprefix|tojson }}');*/
+/*{% endif %}*/
+
+{% set has_tag_filters_extra='' %}
+
+</script>
+
+<script src="{{url_for('static_content', group='js', filename='plugins.js')}}" defer></script>
+<script src="{{url_for('static_content', group='js', filename='global-settings.js')}}" defer></script>
+<script src="{{url_for('static_content', group='js', filename='watch-settings.js')}}" defer></script>
+<script src="{{url_for('static_content', group='js', filename='notifications.js')}}" defer></script>
+
+<div class="edit-form monospaced-textarea">
+
+    <div class="tabs collapsable">
+        <ul>
+            <li class="tab" id=""><a href="#general">{{ _('General') }}</a></li>
+            {# Always shown, like the watch edit page: with no provider configured the pane
+               explains how to set one up (and carries the AI switches through on save). #}
+{%- if not llm_features_disabled %}
+            <li class="tab"><a href="#ai-llm">{{ _('AI / LLM') }}</a></li>
+{%- endif -%}
+            <li class="tab"><a href="#filters-and-triggers">{{ _('Filters & Triggers') }}</a></li>
+            {% if extra_tab_content %}
+            <li class="tab"><a href="#extras_tab">{{ extra_tab_content }}</a></li>
+            {% endif %}
+            <li class="tab"><a href="#notifications">{{ _('Notifications') }}</a></li>
+        </ul>
+    </div>
+
+    <div class="box-wrap inner">
+        <form class="pure-form pure-form-stacked"
+              action="{{ url_for('tags.form_tag_edit', uuid=data.uuid) }}" method="POST">
+             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+            <div class="tab-pane-inner" id="general">
+                <fieldset>
+                    <div class="pure-control-group">
+                        {{ render_field(form.title, placeholder="https://...", required=true, class="m-d") }}
+                    </div>
+                    <div class="pure-control-group">
+                        {{ render_field(form.url_match_pattern, class="m-d") }}
+                        <span class="pure-form-message-inline">{{ _('Automatically applies this tag to any watch whose URL matches. Supports wildcards: <code>*example.com*</code> or plain substring: <code>github.com/myorg</code>')|safe }}</span>
+                    </div>
+                    {% if matching_watches %}
+                    <div class="pure-control-group">
+                        <label>{{ _('Currently matching watches') }} ({{ matching_watches|length }})</label>
+                        <ul class="tag-url-match-list">
+                            {% for w_uuid, w in matching_watches.items() %}
+                            <li><a href="{{ url_for('ui.ui_edit.edit_page', uuid=w_uuid) }}">{{ w.label }}</a></li>
+                            {% endfor %}
+                        </ul>
+                    </div>
+                    {% endif %}
+                    <div class="pure-control-group">
+                        <label>{{ _('Tag colour') }}</label>
+                        {%- set tag_colour = data.get('tag_colour')|safe_css_colour -%}
+                        <div style="display:flex; align-items:center; gap:0.75em;">
+                            <input type="checkbox" id="use_custom_colour"
+                                   {% if tag_colour %}checked{% endif %}>
+                            <label for="use_custom_colour" style="margin:0">{{ _('Custom colour') }}</label>
+                            <input type="color" id="tag_colour_picker"
+                                   value="{{ tag_colour or '#4f8ef7' }}"
+                                   {% if not tag_colour %}disabled{% endif %}>
+                            <input type="hidden" name="tag_colour" id="tag_colour_hidden"
+                                   value="{{ tag_colour }}">
+                        </div>
+                        <span class="pure-form-message-inline">{{ _('Leave unchecked to use the auto-generated colour based on the tag name.') }}</span>
+                    </div>
+                    <script>
+                    (function () {
+                        var cb = document.getElementById('use_custom_colour');
+                        var picker = document.getElementById('tag_colour_picker');
+                        var hidden = document.getElementById('tag_colour_hidden');
+                        picker.addEventListener('input', function () { hidden.value = this.value; });
+                        cb.addEventListener('change', function () {
+                            picker.disabled = !this.checked;
+                            hidden.value = this.checked ? picker.value : '';
+                        });
+                    })();
+                    </script>
+                </fieldset>
+            </div>
+{%- if not llm_features_disabled %}
+            <div class="tab-pane-inner" id="ai-llm">
+                {% include "edit/include_llm_intent.html" %}
+            </div>
+{%- endif -%}
+            <div class="tab-pane-inner" id="filters-and-triggers">
+                {# TRANSLATORS: CJK fonts lack native italics; allow substitution with conventional local styling. dennis-ignore: W303 #}
+                <p>{{ _('These settings are <strong><i>added</i></strong> to any existing watch configurations.')|safe }}</p>
+
+                {% include "edit/include_subtract.html" %}
+                <div class="text-filtering border-fieldset">
+                    <h3>{{ _('Text filtering') }}</h3>
+                    {% include "edit/text-options.html" %}
+                </div>
+            </div>
+
+        {# rendered sub Template #}
+        {% if extra_form_content %}
+            <div class="tab-pane-inner" id="extras_tab">
+            {{ extra_form_content|safe }}
+            </div>
+        {% endif %}
+            <div class="tab-pane-inner" id="notifications">
+                <fieldset>
+                    <div  class="pure-control-group inline-radio">
+                      {{ render_ternary_field(form.notification_muted, BooleanField=True) }}
+                    </div>
+                    {% if 1 %}
+                    <div class="pure-control-group inline-radio">
+                      {{ render_checkbox_field(form.notification_screenshot) }}
+                        <span class="pure-form-message-inline">
+                            <strong>{{ _('Use with caution!') }}</strong> {{ _('This will easily fill up your email storage quota or flood other storages.') }}
+                        </span>
+                    </div>
+                    {% endif %}
+                    <div class="field-group" id="notification-field-group">
+                        {% if has_default_notification_urls %}
+                        <div class="inline-warning">
+                            <img class="inline-warning-icon" src="{{url_for('static_content', group='images', filename='notice.svg')}}" alt="{{ _('Look out!') }}" title="{{ _('Lookout!') }}" >
+                            {{ _('There are <a href="%(url)s">system-wide notification URLs enabled</a>, this form will override notification settings for this watch only &dash; an empty Notification URL list here will still send notifications.', url=url_for('settings.notifications.apprise'))|safe }}
+                        </div>
+                        {% endif %}
+                        <a href="#notifications" id="notification-setting-reset-to-default" class="pure-button button-xsmall" style="right: 20px; top: 20px; position: absolute; background-color: #5f42dd; border-radius: 4px; font-size: 70%; color: #fff">{{ _('Use system defaults') }}</a>
+
+                        {{ render_common_settings_form(form, emailprefix, settings_application, extra_notification_token_placeholder_info) }}
+                    </div>
+                </fieldset>
+            </div>
+
+            <div id="actions">
+                <div class="pure-control-group">
+                    {{ render_button(form.save_button) }}
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
+{% endblock %}

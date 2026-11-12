@@ -1,0 +1,459 @@
+import ipaddress
+import re
+import socket
+from loguru import logger
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, quote, unquote
+
+
+def normalize_url_encoding(url):
+    """
+    Safely encode a URL's query parameters, regardless of whether they're already encoded.
+
+    Why this is necessary:
+    URLs can arrive in various states - some with already encoded query parameters (%20 for spaces),
+    some with unencoded parameters (literal spaces), or a mix of both. The validators.url() function
+    requires proper encoding, but simply encoding an already-encoded URL would double-encode it
+    (e.g., %20 would become %2520).
+
+    This function solves the problem by:
+    1. Parsing the URL to extract query parameters
+    2. parse_qsl() automatically decodes parameters if they're encoded
+    3. urlencode() re-encodes them properly
+    4. Returns a consistently encoded URL that will pass validation
+
+    Example:
+    - Input:  "http://example.com/test?time=2025-10-28 09:19"  (space not encoded)
+    - Output: "http://example.com/test?time=2025-10-28+09%3A19" (properly encoded)
+
+    - Input:  "http://example.com/test?time=2025-10-28%2009:19" (already encoded)
+    - Output: "http://example.com/test?time=2025-10-28+09%3A19" (properly encoded)
+
+    Returns a properly encoded URL string.
+    """
+    try:
+        # Parse the URL into components (scheme, netloc, path, params, query, fragment)
+        parsed = urlparse(url)
+
+        # Parse query string - this automatically decodes it if encoded
+        # parse_qsl handles both encoded and unencoded query strings gracefully
+        query_params = parse_qsl(parsed.query, keep_blank_values=True)
+
+        # Re-encode the query string properly using standard URL encoding
+        encoded_query = urlencode(query_params, safe='')
+
+        # Fragments need the same treatment - browsers accept characters there that
+        # RFC 3986 does not (e.g. '|' in "...w-4#int=S:PFreco|PF|48966", see issue #4209)
+        # and validators.url() would reject them. unquote() first so an already-encoded
+        # fragment isn't double-encoded, then re-quote keeping every character that
+        # RFC 3986 allows in a fragment (pchar / "/" / "?") intact.
+        encoded_fragment = quote(unquote(parsed.fragment), safe="/?:@!$&'()*+,;=")
+
+        # Reconstruct the URL with properly encoded query string
+        normalized = urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            encoded_query,  # Use the re-encoded query
+            encoded_fragment  # Use the re-encoded fragment
+        ))
+
+        return normalized
+    except Exception as e:
+        # If parsing fails for any reason, return original URL
+        logger.debug(f"URL normalization failed for '{url}': {e}")
+        return url
+
+
+# Address blocks that are NOT globally reachable but which Python's ipaddress flags
+# (is_private / is_loopback / is_link_local / is_reserved) do not report — so relying on
+# those four alone leaves them fetchable. Each entry states what it is and why it matters:
+#
+#   100.64.0.0/10   RFC 6598 Carrier-Grade NAT "shared address space". Not private per
+#                   ipaddress, yet it is exactly where an ISP/cloud tenant's other
+#                   customers, CPE admin panels and CGNAT gateways live. This is the
+#                   incomplete-remediation gap reported in GHSA-gwph-fp79-379w.
+#   192.88.99.0/24  RFC 7526 deprecated 6to4 relay anycast.
+#   224.0.0.0/4     IPv4 multicast (includes 224.0.0.1 all-hosts).
+#   ff00::/8        IPv6 multicast (includes ff02::1 link-local all-nodes).
+#   3fff::/20       RFC 9637 documentation range; unknown to older Python releases.
+#
+# Kept as an explicit, documented list rather than leaning only on `not ip.is_global`
+# because the meaning of is_global has shifted between Python releases; the is_global
+# check below is a belt-and-braces catch-all on top of these, never a replacement.
+_NON_GLOBAL_EXTRA_NETWORKS = tuple(
+    ipaddress.ip_network(n) for n in (
+        '100.64.0.0/10',
+        '192.88.99.0/24',
+        '224.0.0.0/4',
+        'ff00::/8',
+        '3fff::/20',
+    )
+)
+
+
+def is_special_purpose_ip(ip):
+    """Return (blocked: bool, why: str) for a single resolved IP address.
+
+    THE one place that decides "is this address off-limits to the fetcher?". Everything
+    that resolves a hostname must funnel through here so a newly-discovered range is
+    added once, not once per call site.
+
+    IPv6 addresses that embed an IPv4 address (IPv4-mapped, 6to4, Teredo) are unwrapped
+    and re-checked, so e.g. ::ffff:100.64.0.1 cannot smuggle a blocked v4 address past a
+    v6-only classification.
+    """
+    if isinstance(ip, str):
+        ip = ipaddress.ip_address(ip)
+
+    if ip.is_private:
+        return True, 'private'
+    if ip.is_loopback:
+        return True, 'loopback'
+    if ip.is_link_local:
+        return True, 'link-local'
+    if ip.is_reserved:
+        return True, 'reserved'
+    if ip.is_multicast:
+        return True, 'multicast'
+    if ip.is_unspecified:
+        return True, 'unspecified'
+
+    for net in _NON_GLOBAL_EXTRA_NETWORKS:
+        if ip.version == net.version and ip in net:
+            return True, f'in non-globally-reachable range {net}'
+
+    # Catch-all for ranges this Python release knows are not globally reachable but which
+    # none of the flags above expose (100.64.0.0/10 is such a case on CPython 3.12).
+    if not ip.is_global:
+        return True, 'not globally reachable'
+
+    # An IPv6 address carrying an IPv4 payload is only as safe as that payload.
+    for embedded in (getattr(ip, 'ipv4_mapped', None), getattr(ip, 'sixtofour', None), getattr(ip, 'teredo', None)):
+        if embedded is None:
+            continue
+        # .teredo returns a (server, client) tuple; the others return a single address.
+        for candidate in (embedded if isinstance(embedded, tuple) else (embedded,)):
+            blocked, why = is_special_purpose_ip(candidate)
+            if blocked:
+                return True, f'embeds IPv4 address {candidate} ({why})'
+
+    return False, ''
+
+
+def is_private_hostname(hostname, classify_only=False):
+    """Return True if hostname resolves to an IANA-restricted (private/reserved/non-global) IP address.
+
+    classify_only=True is for callers that only want to know whether a host is local
+    (e.g. picking a longer LLM timeout) and are not refusing anything - logs at debug
+    instead of a misleading "refused" warning (issue #4700).
+
+    Unresolvable hostnames return False (allow them) — DNS may be temporarily unavailable
+    or the domain not yet live. The actual DNS rebinding attack is mitigated by fetch-time
+    re-validation in requests.py, not by blocking unresolvable domains at add-time.
+    Never cached — callers that need fresh DNS resolution (e.g. at fetch time) can call
+    this directly without going through the lru_cached is_safe_valid_url().
+
+    A hostname is refused if ANY of its A/AAAA records is off-limits: a name that answers
+    with one public and one CGNAT address is still a route to the CGNAT address.
+    """
+    try:
+        for info in socket.getaddrinfo(hostname, None):
+            ip = ipaddress.ip_address(info[4][0])
+            blocked, why = is_special_purpose_ip(ip)
+            if blocked:
+                if classify_only:
+                    logger.debug(f"Hostname '{hostname}' resolves to {ip} which is {why}.")
+                else:
+                    logger.warning(f"Hostname '{hostname}' resolves to {ip} which is {why} — refused.")
+                return True
+    except socket.gaierror as e:
+        (logger.debug if classify_only else logger.warning)(f"{hostname} error checking {str(e)}")
+        return False
+    except ValueError as e:
+        # getaddrinfo handed back something ip_address() won't parse - fail closed.
+        logger.warning(f"Hostname '{hostname}' produced an unparseable address ({e}) — refused.")
+        return True
+    (logger.debug if classify_only else logger.info)(f"Hostname '{hostname}' is NOT private/IANA restricted.")
+    return False
+
+
+def extract_url_hostnames(url):
+    """Return every hostname this URL could resolve to under different URL parsers.
+
+    Why: urllib's urlparse() and urllib3's parse_url() disagree on URLs containing
+    a backslash (e.g. http://INTERNAL:8888\\@PUBLIC/ — urlparse extracts PUBLIC, but
+    urllib3/requests will actually connect to INTERNAL). Any SSRF check that trusts
+    only one parser can be bypassed by the other. Callers should reject the fetch
+    if ANY hostname returned here is private/reserved.
+
+    See GHSA-rph4-96w6-q594.
+    """
+    hostnames = set()
+    try:
+        h = urlparse(url).hostname
+        if h:
+            hostnames.add(h)
+    except Exception:
+        pass
+    try:
+        from urllib3.util.url import parse_url as _u3_parse_url
+        u3 = _u3_parse_url(url)
+        if u3.host:
+            # urllib3 keeps IPv6 brackets in `.host`; strip them so socket.getaddrinfo() accepts the literal.
+            hostnames.add(u3.host.strip('[]'))
+    except Exception:
+        pass
+    return hostnames
+
+
+def is_url_private_or_parser_confused(url):
+    """SSRF gate that defends against urlparse/urllib3 parser-differential attacks.
+
+    Returns True (block the fetch) when:
+      * the URL contains a backslash — no legitimate URL needs one, and it is the
+        established vector for the parser-differential bypass (GHSA-rph4-96w6-q594), OR
+      * any hostname produced by urlparse OR urllib3 resolves to an address that
+        is_special_purpose_ip() refuses (private, loopback, link-local, reserved,
+        multicast, CGNAT/RFC 6598 or otherwise not globally reachable).
+    """
+    if '\\' in url:
+        logger.warning(f"URL '{url}' contains a backslash — rejected to prevent urlparse/urllib3 parser-differential SSRF.")
+        return True
+    for hostname in extract_url_hostnames(url):
+        if is_private_hostname(hostname):
+            return True
+    return False
+
+
+def is_fetch_url_allowed(url):
+    """THE single gate for "is the server allowed to fetch this URL?".
+
+    Returns (ok: bool, reason: str) — `reason` is safe to show the user.
+
+    Call this from EVERY entry point that causes a server-side fetch. The checks used to live
+    inline in difference_detection_processor.call_browser(), on the documented assumption that
+    "every fetch goes through call_browser()". That stopped being true once the live Browser
+    Steps UI and the Add Watch snapshot preview grew their own fetch paths — each silently
+    skipped both the file:// and the private-IP gate (GHSA-hm22-wg2m-35v4, GHSA-56fq-63vj-9992).
+    Rather than re-assert that invariant, every fetch path now calls this function.
+
+    Layers, in order:
+      1. Render Jinja2 and strip the 'source:' meta prefix, so what gets checked is what the
+         browser/requests library will actually be handed. Stripping is load-bearing, not
+         cosmetic: urlparse('source:http://127.0.0.1/') reports NO hostname at all, so an
+         unstripped value sails straight past the private-IP check in step 5.
+      2. file:// refused unless ALLOW_FILE_URI=true. Checked explicitly rather than leaning on
+         is_safe_valid_url()'s scheme allowlist, because an operator who loosened
+         SAFE_PROTOCOL_REGEX for some other scheme should not silently get local file reads too.
+      3. Backslash rejection (GHSA-rph4-96w6-q594) — unconditional, including when the operator
+         has opted into private addresses.
+      4. is_safe_valid_url() — scheme allowlist, '<>' rejection, validators.url().
+      5. Non-globally-reachable address rejection, unless ALLOW_IANA_RESTRICTED_ADDRESSES=true.
+         This step owns no logic of its own: it delegates to is_private_hostname() ->
+         is_special_purpose_ip(), which is the single list of refused address classes
+         (private, loopback, link-local, reserved, multicast, RFC 6598 CGNAT, ...). Add new
+         ranges there and every fetch path, the notification handlers and the LLM api_base
+         check pick them up together — see GHSA-gwph-fp79-379w, where CGNAT space was missing
+         from that predicate and so this gate let 100.64.0.0/10 through.
+
+    Step 5 performs DNS resolution and therefore blocks. From async code call
+    validate_fetch_url_async() instead so the event loop keeps turning.
+
+    Note this validates one URL, not a redirect chain. content_fetchers/requests.py follows
+    redirects manually and re-checks each hop; the Chromium-based fetchers cannot do that yet,
+    so an open redirect on a public host remains a known gap for those backends.
+    """
+    import os
+    import re
+    from changedetectionio.strtobool import strtobool
+    from changedetectionio.jinja2_custom import JINJA2_MARKER_PATTERN, render as jinja_render
+
+    if not url or not isinstance(url, str) or not url.strip():
+        return False, "No URL specified."
+
+    url = url.strip()
+
+    # Jinja2 first — the fetch uses the rendered value, so the rendered value is what must pass.
+    if JINJA2_MARKER_PATTERN.search(url):
+        try:
+            url = jinja_render(template_str=url).strip()
+        except Exception as e:
+            logger.error(f"URL '{url}' is not valid Jinja2? {str(e)}")
+            return False, "The URL contains invalid Jinja2 template syntax."
+
+    # 'source:' is our own meta prefix meaning "return the raw source"; it is not part of the
+    # URL that gets fetched. Must be removed before any hostname parsing happens - see step 1 above.
+    url = re.sub(r'^source:', '', url, flags=re.IGNORECASE).strip()
+
+    if re.match(r'^file:', url, re.IGNORECASE) and not strtobool(os.getenv('ALLOW_FILE_URI', 'false')):
+        logger.warning(f"Fetch blocked: file:// access is disabled (ALLOW_FILE_URI) - '{url}'")
+        return False, "file:// type access is denied for security reasons."
+
+    # Checked here in its own right, not left to is_safe_valid_url()/is_url_private_or_parser_confused():
+    # a backslash is never legitimate in a URL, so it must be refused even when the operator has
+    # opted into private addresses with ALLOW_IANA_RESTRICTED_ADDRESSES (GHSA-rph4-96w6-q594).
+    if '\\' in url:
+        logger.warning(f"Fetch blocked: '{url}' contains a backslash (parser-differential SSRF vector).")
+        return False, f"Fetch blocked: '{url}' contains a parser-differential payload (backslash)."
+
+    if not is_safe_valid_url(url):
+        return False, "The URL is invalid or uses an unsupported protocol."
+
+    if not strtobool(os.getenv('ALLOW_IANA_RESTRICTED_ADDRESSES', 'false')):
+        if is_url_private_or_parser_confused(url):
+            return False, (
+                f"Fetch blocked: '{url}' resolves to a private/reserved IP address "
+                f"or contains a parser-differential payload. "
+                f"Set ALLOW_IANA_RESTRICTED_ADDRESSES=true to allow."
+            )
+
+    return True, ''
+
+
+def validate_fetch_url(url):
+    """is_fetch_url_allowed() as an assertion - raises ValueError with the reason.
+
+    Use at fetch entry points that should abort loudly (the message surfaces to the user as a
+    watch error or an HTTP 400). Blocks on DNS; from async code use validate_fetch_url_async().
+    """
+    ok, reason = is_fetch_url_allowed(url)
+    if not ok:
+        raise ValueError(reason)
+
+
+async def validate_fetch_url_async(url):
+    """validate_fetch_url() with the DNS lookup pushed to a thread so the event loop isn't blocked."""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    ok, reason = await loop.run_in_executor(None, is_fetch_url_allowed, url)
+    if not ok:
+        raise ValueError(reason)
+
+
+def is_llm_api_base_safe(api_base):
+    """SSRF guard for the LLM `api_base` setting (GHSA-jrxm-qjfh-g54f).
+
+    Returns (ok: bool, reason: str). Empty/None api_base is allowed (cloud providers
+    don't need it). When ALLOW_IANA_RESTRICTED_ADDRESSES=true the check is bypassed
+    so operators can intentionally point at local Ollama / vLLM / LM Studio.
+
+    Call this from EVERY write path that accepts `llm.api_base` from the user —
+    form validation, AJAX endpoints, and any future REST/import endpoint. The
+    existing call sites are forms.py (validateLLMApiBaseSafe) and
+    blueprint/settings/llm/__init__.py (both /models and /test).
+    """
+    import os
+    from changedetectionio.strtobool import strtobool
+    from flask_babel import gettext
+
+    if not api_base or not api_base.strip():
+        return True, ''
+
+    if strtobool(os.getenv('ALLOW_IANA_RESTRICTED_ADDRESSES', 'false')):
+        return True, ''
+
+    api_base = api_base.strip()
+
+    if not is_safe_valid_url(api_base):
+        return False, gettext("API Base URL is not a valid http(s) URL.")
+
+    hostname = urlparse(api_base).hostname
+    if hostname and is_private_hostname(hostname):
+        return False, gettext(
+            "API Base URL resolves to a private, loopback, link-local or reserved "
+            "IP address and was blocked to prevent SSRF. To allow LLM endpoints on private networks "
+            "(e.g. a local Ollama server) set the environment variable "
+            "ALLOW_IANA_RESTRICTED_ADDRESSES=true and restart."
+        )
+
+    return True, ''
+
+
+def is_safe_valid_url(test_url):
+    from changedetectionio import strtobool
+    from changedetectionio.jinja2_custom import JINJA2_MARKER_PATTERN, render as jinja_render
+    import os
+    import validators
+
+    # Validate input type first - must be a non-empty string
+    if test_url is None:
+        logger.warning('URL validation failed: URL is None')
+        return False
+
+    if not isinstance(test_url, str):
+        logger.warning(f'URL validation failed: URL must be a string, got {type(test_url).__name__}')
+        return False
+
+    if not test_url.strip():
+        logger.warning('URL validation failed: URL is empty or whitespace only')
+        return False
+
+    # Per-request cache: same URL is often validated 2-3x per watchlist render (sort + display).
+    # Flask's g is scoped to one request and auto-cleared on teardown, so dynamic Jinja2 URLs
+    # like {{microtime()}} are always re-evaluated on the next request.
+    # Falls back gracefully when called outside a request context (e.g. background workers).
+    _cache_key = test_url
+    try:
+        from flask import g
+        _cache = g.setdefault('_url_validation_cache', {})
+        if _cache_key in _cache:
+            return _cache[_cache_key]
+    except RuntimeError:
+        _cache = None  # No app context
+
+    allow_file_access = strtobool(os.getenv('ALLOW_FILE_URI', 'false'))
+    safe_protocol_regex = '^(http|https|ftp|file):' if allow_file_access else '^(http|https|ftp):'
+
+    # See https://github.com/dgtlmoon/changedetection.io/issues/1358
+
+    # Remove 'source:' prefix so we dont get 'source:javascript:' etc
+    # 'source:' is a valid way to tell us to return the source
+
+    r = re.compile('^source:', re.IGNORECASE)
+    test_url = r.sub('', test_url)
+
+    # Check the actual rendered URL in case of any Jinja markup
+    # Only run jinja_render when the URL actually contains Jinja2 syntax - creating a new
+    # ImmutableSandboxedEnvironment is expensive and is called once per watch per page load
+    if JINJA2_MARKER_PATTERN.search(test_url):
+        try:
+            test_url = jinja_render(test_url)
+        except Exception as e:
+            logger.error(f'URL "{test_url}" is not correct Jinja2? {str(e)}')
+            return False
+
+    # Check query parameters and fragment
+    if re.search(r'[<>]', test_url):
+        logger.warning(f'URL "{test_url}" contains suspicious characters')
+        return False
+
+    # Reject backslashes — urllib's urlparse and urllib3's parse_url disagree on URLs containing
+    # a backslash (e.g. http://INTERNAL:8888\@PUBLIC/), which is the documented SSRF bypass in
+    # GHSA-rph4-96w6-q594. A backslash has no legitimate use in an HTTP URL, so block at add-time.
+    if '\\' in test_url:
+        logger.warning(f'URL "{test_url}" contains a backslash — rejected (parser-differential SSRF vector).')
+        return False
+
+    # Normalize URL encoding - handle both encoded and unencoded query parameters
+    test_url = normalize_url_encoding(test_url)
+
+    # Be sure the protocol is safe (no file, etcetc)
+    pattern = re.compile(os.getenv('SAFE_PROTOCOL_REGEX', safe_protocol_regex), re.IGNORECASE)
+    if not pattern.match(test_url.strip()):
+        logger.warning(f'URL "{test_url}" is not safe, aborting.')
+        return False
+
+    # If hosts that only contain alphanumerics are allowed ("localhost" for example)
+    allow_simplehost = not strtobool(os.getenv('BLOCK_SIMPLEHOSTS', 'False'))
+    try:
+        if not test_url.strip().lower().startswith('file:') and not validators.url(test_url, simple_host=allow_simplehost):
+            logger.warning(f'URL "{test_url}" failed validation, aborting.')
+            return False
+    except validators.ValidationError:
+        logger.warning(f'URL f"{test_url}" failed validation, aborting.')
+        return False
+
+    if _cache is not None:
+        _cache[_cache_key] = True
+    return True

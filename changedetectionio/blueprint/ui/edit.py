@@ -1,0 +1,572 @@
+from copy import deepcopy
+import os
+import importlib.resources
+from flask import Blueprint, request, redirect, url_for, flash, render_template, abort
+from flask_babel import gettext
+from loguru import logger
+from jinja2 import Environment, FileSystemLoader
+
+from changedetectionio.store import ChangeDetectionStore
+from changedetectionio.auth_decorator import login_optionally_required
+from changedetectionio.time_handler import default_timezone_name, is_within_schedule
+from changedetectionio import worker_pool
+from changedetectionio.llm.evaluator import get_llm_config as _get_llm_config
+
+def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMetaData):
+    edit_blueprint = Blueprint('ui_edit', __name__, template_folder="../ui/templates")
+
+    def _watch_tags(watch):
+        """(uuid, tag) for this watch's tags, in its own tag order, skipping UUIDs we don't know."""
+        tags = datastore.data['settings']['application'].get('tags', {})
+        return [(tag_uuid, tags[tag_uuid]) for tag_uuid in watch.get('tags', []) if tag_uuid in tags]
+
+    def _resolve_llm_group_overrides(watch, datastore) -> dict:
+        """
+        For each LLM field (llm_intent, llm_change_summary): if the watch has no own
+        value but a linked group does, return {'value': ..., 'group_name': ..., 'group_uuid': ...}
+        so the edit template can show the inherited value as the textarea placeholder and link
+        back to the group that supplied it.
+        Returns None for each field when the watch has its own value (nothing inherited).
+
+        Only groups whose AI setting is "On" lend their prompts — the same gate the evaluator
+        applies via resolve_llm_field(), so the placeholder always reflects what will actually
+        run. See llm/evaluator.py:tag_llm_decision().
+        """
+        from changedetectionio.llm.evaluator import tag_llm_applies_to_watches, tag_llm_decision
+
+        result = {'llm_intent': None, 'llm_change_summary': None, 'llm_backend_profile': None}
+
+        # AI on/off is not a "fill in the blank" field: a group that has taken the decision
+        # (On or Off, i.e. not "leave it to each watch") decides for every watch in it (#4204),
+        # so report it and let the template show the watch's own checkbox as overridden.
+        for tag_uuid, tag in _watch_tags(watch):
+            if tag_llm_decision(tag) is not None:
+                result['llm_backend_profile'] = {
+                    'value': tag_llm_decision(tag),
+                    'group_name': tag.get('title', 'tag'),
+                    'group_uuid': tag_uuid,
+                }
+                break
+
+        for field in ('llm_intent', 'llm_change_summary'):
+            if (watch.get(field) or '').strip():
+                continue  # watch has its own value — editable, no group override
+            for tag_uuid, tag in _watch_tags(watch):
+                if not tag_llm_applies_to_watches(tag):
+                    continue
+                if (tag.get(field) or '').strip():
+                    result[field] = {
+                        'value': tag.get(field).strip(),
+                        'group_name': tag.get('title', 'tag'),
+                        'group_uuid': tag_uuid,
+                    }
+                    break
+        return result
+
+    def _watch_has_tag_options_set(watch):
+        """This should be fixed better so that Tag is some proper Model, a tag is just a Watch also"""
+        for tag_uuid, tag in datastore.data['settings']['application'].get('tags', {}).items():
+            if tag_uuid in watch.get('tags', []) and (tag.get('include_filters') or tag.get('subtractive_selectors')):
+                return True
+
+    def _save_plugin_request_settings(watch, section, data):
+        from changedetectionio.pluggy_interface import load_watch_plugin_settings, save_watch_plugin_settings
+        plugin_id = section['plugin_id']
+        try:
+            if section.get('on_save'):
+                data = section['on_save'](watch, data, load_watch_plugin_settings(watch, plugin_id))
+            save_watch_plugin_settings(watch, plugin_id, data or {})
+        except Exception as e:
+            logger.exception(f"Saving '{plugin_id}' settings for watch {watch.get('uuid')} failed: {e}")
+            flash(gettext("Could not save the '{}' settings, see the log.").format(plugin_id), 'error')
+
+    @edit_blueprint.route("/edit/<uuid_str:uuid>", methods=['GET', 'POST'])
+    @login_optionally_required
+    # https://stackoverflow.com/questions/42984453/wtforms-populate-form-with-data-if-data-exists
+    # https://wtforms.readthedocs.io/en/3.0.x/forms/#wtforms.form.Form.populate_obj ?
+    def edit_page(uuid):
+        from changedetectionio import forms
+        from changedetectionio.browser_steps.browser_steps import browser_step_ui_config
+        from changedetectionio import processors
+        import importlib
+
+        if uuid == 'first':
+            uuid = list(datastore.data['watching'].keys()).pop()
+        # More for testing, possible to return the first/only
+        if not datastore.data['watching'].keys():
+            flash(gettext("No watches to edit"), "error")
+            return redirect(url_for('watchlist.index'))
+
+        if not uuid in datastore.data['watching']:
+            flash(gettext("No watch with the UUID {} found.").format(uuid), "error")
+            return redirect(url_for('watchlist.index'))
+
+        switch_processor = request.args.get('switch_processor')
+        if switch_processor:
+            for p in processors.available_processors():
+                if p[0] == switch_processor:
+                    datastore.data['watching'][uuid]['processor'] = switch_processor
+                    flash(gettext("Switched to mode - {}.").format(p[1]))
+                    datastore.clear_watch_history(uuid)
+                    redirect(url_for('ui_edit.edit_page', uuid=uuid))
+
+        # be sure we update with a copy instead of accidently editing the live object by reference
+        default = None
+        while not default:
+            try:
+                default = deepcopy(datastore.data['watching'][uuid])
+            except RuntimeError as e:
+                # Dictionary changed
+                continue
+
+        # Defaults for proxy choice
+        if datastore.proxy_list is not None:  # When enabled
+            # @todo
+            # Radio needs '' not None, or incase that the chosen one no longer exists
+            if default['proxy'] is None or not any(default['proxy'] in tup for tup in datastore.proxy_list):
+                default['proxy'] = ''
+        # proxy_override set to the json/text list of the items
+
+        # Does it use some custom form? does one exist?
+        processor_name = datastore.data['watching'][uuid].get('processor', '')
+        processor_classes = next((tpl for tpl in processors.find_processors() if tpl[1] == processor_name), None)
+        if not processor_classes:
+            flash(gettext("Could not load '{}' processor, processor plugin might be missing. Please select a different processor.").format(processor_name), 'error')
+            # Fall back to default processor so user can still edit and change processor
+            processor_classes = next((tpl for tpl in processors.find_processors() if tpl[1] == 'text_json_diff'), None)
+            if not processor_classes:
+                # If even text_json_diff is missing, something is very wrong
+                flash(gettext("Could not load '{}' processor, processor plugin might be missing.").format(processor_name), 'error')
+                return redirect(url_for('watchlist.index'))
+
+        parent_module = processors.get_parent_module(processor_classes[0])
+
+        try:
+            # Get the parent of the "processor.py" go up one, get the form (kinda spaghetti but its reusing existing code)
+            forms_module = importlib.import_module(f"{parent_module.__name__}.forms")
+            # Access the 'processor_settings_form' class from the 'forms' module
+            form_class = getattr(forms_module, 'processor_settings_form')
+        except ModuleNotFoundError as e:
+            # .forms didnt exist
+            form_class = forms.processor_text_json_diff_form
+        except AttributeError as e:
+            # .forms exists but no useful form
+            form_class = forms.processor_text_json_diff_form
+
+        # Plugins' own per-watch settings in the Request tab (ui_edit_request_settings hook), nested forms kept
+        # in the watch's data dir, never in the watch itself
+        from changedetectionio.pluggy_interface import get_ui_edit_request_settings, load_watch_plugin_settings
+        plugin_request_settings = get_ui_edit_request_settings(datastore.data['watching'][uuid], datastore)
+        if plugin_request_settings:
+            from wtforms.fields.form import FormField
+            form_class = type(form_class.__name__, (form_class,),
+                              {section['field_name']: FormField(section['form_class']) for section in plugin_request_settings})
+            for section in plugin_request_settings:
+                default[section['field_name']] = load_watch_plugin_settings(datastore.data['watching'][uuid], section['plugin_id'])
+
+        form = form_class(formdata=request.form if request.method == 'POST' else None,
+                          data=default,
+                          extra_notification_tokens=default.extra_notification_token_values(),
+                          default_system_settings=datastore.data['settings']
+                          )
+
+        # For the form widget tag UUID back to "string name" for the field
+        form.tags.datastore = datastore
+
+        # Used by some forms that need to dig deeper
+        form.datastore = datastore
+        form.watch = default
+
+        # Load processor-specific config from JSON file for GET requests
+        if request.method == 'GET' and processor_name:
+            try:
+                from changedetectionio.processors.base import difference_detection_processor
+                # Create a processor instance to access config methods
+                processor_instance = difference_detection_processor(datastore, uuid)
+                # Use processor name as filename so each processor keeps its own config
+                config_filename = f'{processor_name}.json'
+                processor_config = processor_instance.get_extra_watch_config(config_filename)
+
+                if processor_config:
+                    from wtforms.fields.form import FormField
+                    # Populate processor-config-* fields from JSON
+                    for config_key, config_value in processor_config.items():
+                        if not isinstance(config_value, dict):
+                            continue
+                        # Try exact API-named field first (e.g., processor_config_restock_diff)
+                        target_field = getattr(form, f'processor_config_{config_key}', None)
+                        # Fallback: find any FormField sub-form whose fields cover config_value keys
+                        if target_field is None:
+                            for form_field in form:
+                                if isinstance(form_field, FormField) and all(k in form_field.form._fields for k in config_value):
+                                    target_field = form_field
+                                    break
+                        if target_field is not None:
+                            for sub_key, sub_value in config_value.items():
+                                sub_field = target_field.form._fields.get(sub_key)
+                                if sub_field is not None:
+                                    sub_field.data = sub_value
+                                    logger.debug(f"Loaded processor config from {config_filename}: {sub_key} = {sub_value}")
+            except Exception as e:
+                logger.warning(f"Failed to load processor config: {e}")
+
+        for p in datastore.extra_browsers:
+            form.fetch_backend.choices.append(p)
+
+        form.fetch_backend.choices.append(("system", gettext('System settings default')))
+
+        # form.browser_steps[0] can be assumed that we 'goto url' first
+
+        if datastore.proxy_list is None:
+            # @todo - Couldn't get setattr() etc dynamic addition working, so remove it instead
+            del form.proxy
+        else:
+            form.proxy.choices = [('', gettext('Default'))]
+            for p in datastore.proxy_list:
+                form.proxy.choices.append(tuple((p, datastore.proxy_list[p]['label'])))
+
+
+        if request.method == 'POST' and form.validate():
+
+            extra_update_obj = {
+                'consecutive_filter_failures': 0,
+                'last_error' : False
+            }
+
+            if request.args.get('unpause_on_save'):
+                extra_update_obj['paused'] = False
+
+            extra_update_obj['time_between_check'] = form.time_between_check.data
+
+            # Handle processor-config-* fields separately (save to JSON, not datastore)
+            # IMPORTANT: These must NOT be saved to url-watches.json, only to the processor-specific JSON file
+            processor_config_data = processors.extract_processor_config_from_form_data(form.data)
+            processors.save_processor_config(datastore, uuid, processor_config_data)
+
+            # Only the sections that were on the page, the Request tab isn't shown for every fetcher and an
+            # absent section must not save as empty
+            shown_sections = request.form.getlist('plugin_request_settings_shown')
+            for section in plugin_request_settings:
+                if section['plugin_id'] not in shown_sections:
+                    continue
+                _save_plugin_request_settings(datastore.data['watching'][uuid], section, form[section['field_name']].data)
+
+            # Ignore text
+            form_ignore_text = form.ignore_text.data
+            datastore.data['watching'][uuid]['ignore_text'] = form_ignore_text
+
+            # Be sure proxy value is None
+            if datastore.proxy_list is not None and form.data['proxy'] == '':
+                extra_update_obj['proxy'] = None
+
+            # Unsetting all filter_text methods should make it go back to default
+            # This particularly affects tests running
+            if 'filter_text_added' in form.data and not form.data.get('filter_text_added') \
+                    and 'filter_text_replaced' in form.data and not form.data.get('filter_text_replaced') \
+                    and 'filter_text_removed' in form.data and not form.data.get('filter_text_removed'):
+                extra_update_obj['filter_text_added'] = True
+                extra_update_obj['filter_text_replaced'] = True
+                extra_update_obj['filter_text_removed'] = True
+
+            # A group that has taken the AI on/off decision owns that control, so the edit page
+            # renders it disabled (see include_llm_intent.html). A disabled checkbox isn't
+            # submitted at all, and for a checkbox "not submitted" is indistinguishable from
+            # "unticked" — so don't take this field from the form while a group decides. The
+            # watch keeps its own preference untouched, ready for when the group stops deciding.
+            # Resolved against the watch's *stored* tags — i.e. what the page was rendered from,
+            # so attaching or detaching a group in this same save is still honoured correctly.
+            if _resolve_llm_group_overrides(datastore.data['watching'][uuid], datastore).get('llm_backend_profile'):
+                extra_update_obj['llm_backend_profile'] = datastore.data['watching'][uuid].get('llm_backend_profile', True)
+
+            # Because wtforms doesn't support accessing other data in process_ , but we convert the CSV list of tags back to a list of UUIDs
+            tag_uuids = []
+            if form.data.get('tags'):
+                # Sometimes in testing this can be list, dont know why
+                if type(form.data.get('tags')) == list:
+                    extra_update_obj['tags'] = form.data.get('tags')
+                else:
+                    for t in form.data.get('tags').split(','):
+                        tag_uuids.append(datastore.add_tag(title=t))
+                    extra_update_obj['tags'] = tag_uuids
+
+            plugin_field_names = {section['field_name'] for section in plugin_request_settings}
+            datastore.data['watching'][uuid].update({k: v for k, v in form.data.items() if k not in plugin_field_names})
+            datastore.data['watching'][uuid].update(extra_update_obj)
+
+            if not datastore.data['watching'][uuid].get('tags'):
+                # Force it to be a list, because form.data['tags'] will be string if nothing found
+                # And del(form.data['tags'] ) wont work either for some reason
+                datastore.data['watching'][uuid]['tags'] = []
+
+            # Recast it if need be to right data Watch handler
+            watch_class = processors.get_custom_watch_obj_for_processor(form.data.get('processor'))
+            datastore.data['watching'][uuid] = watch_class(datastore_path=datastore.datastore_path, __datastore=datastore.data, default=datastore.data['watching'][uuid])
+
+            # Save the watch immediately
+            datastore.data['watching'][uuid].commit()
+
+            flash(gettext("Updated watch - unpaused!") if request.args.get('unpause_on_save') else gettext("Updated watch."))
+
+            # Cleanup any browsersteps session for this watch
+            try:
+                from changedetectionio.blueprint.browser_steps import cleanup_session_for_watch
+                cleanup_session_for_watch(uuid)
+            except Exception as e:
+                logger.debug(f"Error cleaning up browsersteps session: {e}")
+
+            # Do not queue on edit if its not within the time range
+
+            # @todo maybe it should never queue anyway on edit...
+            is_in_schedule = True
+            watch = datastore.data['watching'].get(uuid)
+
+            if watch.get('time_between_check_use_default'):
+                time_schedule_limit = datastore.data['settings']['requests'].get('time_schedule_limit') or {}
+            else:
+                time_schedule_limit = watch.get('time_schedule_limit') or {}
+
+            tz_name = default_timezone_name(
+                time_schedule_limit.get('timezone')
+                or datastore.data['settings']['application'].get('scheduler_timezone_default')
+            )
+
+            if time_schedule_limit and time_schedule_limit.get('enabled'):
+                try:
+                    is_in_schedule = is_within_schedule(time_schedule_limit=time_schedule_limit,
+                                                      default_tz=tz_name
+                                                      )
+                except Exception as e:
+                    # Only decides whether to queue an immediate recheck — the watch is
+                    # already saved by this point. Returning a bare `False` from a view
+                    # made Flask raise TypeError and the save appeared to fail with a 500.
+                    logger.error(
+                        f"{uuid} - Recheck scheduler, error handling timezone, check skipped - TZ name '{tz_name}' - {str(e)}")
+                    is_in_schedule = False
+
+            #############################
+            if not datastore.data['watching'][uuid].get('paused') and is_in_schedule:
+                # Queue the watch for immediate recheck, with a higher priority
+                worker_pool.queue_item_async_safe(update_q, queuedWatchMetaData.PrioritizedItem(priority=1, item={'uuid': uuid}))
+
+            # Diff page [edit] link should go back to diff page
+            if request.args.get("next") and request.args.get("next") == 'diff':
+                return redirect(url_for('ui.ui_diff.diff_history_page', uuid=uuid))
+
+            return redirect(url_for('watchlist.index', tag=request.args.get("tag",'')))
+
+        else:
+            if request.method == 'POST' and not form.validate():
+                flash(gettext("An error occurred, please see below."), "error")
+
+            # JQ is difficult to install on windows and must be manually added (outside requirements.txt)
+            jq_support = True
+            try:
+                import jq
+            except ModuleNotFoundError:
+                jq_support = False
+
+            watch = datastore.data['watching'].get(uuid)
+
+            from zoneinfo import available_timezones
+
+            # Import the global plugin system
+            from changedetectionio.pluggy_interface import collect_ui_edit_stats_extras, get_fetcher_capabilities
+
+            # Get fetcher capabilities instead of hardcoded logic
+            capabilities = get_fetcher_capabilities(watch, datastore)
+
+            # Add processor capabilities from module
+            capabilities['supports_visual_selector'] = getattr(parent_module, 'supports_visual_selector', False)
+            capabilities['supports_text_filters_and_triggers'] = getattr(parent_module, 'supports_text_filters_and_triggers', False)
+            capabilities['supports_text_filters_and_triggers_elements'] = getattr(parent_module, 'supports_text_filters_and_triggers_elements', False)
+            capabilities['supports_request_type'] = getattr(parent_module, 'supports_request_type', False)
+
+            app_rss_token = datastore.data['settings']['application'].get('rss_access_token'),
+
+            c = [f"processor-{watch.get('processor')}"]
+            if worker_pool.is_watch_running(uuid):
+                c.append('checking-now')
+
+            template_args = {
+                'available_processors': processors.available_processors(),
+                'available_timezones': sorted(available_timezones()),
+                'browser_steps_config': browser_step_ui_config,
+                'emailprefix': os.getenv('NOTIFICATION_MAIL_BUTTON_PREFIX', False),
+                'extra_classes': ' '.join(c),
+                'extra_notification_token_placeholder_info': datastore.get_unique_notification_token_placeholders_available(),
+                'extra_processor_config': form.extra_tab_content(),
+                'extra_title': f" - {gettext('Edit')} - {watch.label}",
+                'form': form,
+                'has_default_notification_urls': True if len(datastore.data['settings']['application']['notification_urls']) else False,
+                'has_extra_headers_file': len(datastore.get_all_headers_in_textfile_for_watch(uuid=uuid)) > 0,
+                'has_special_tag_options': _watch_has_tag_options_set(watch=watch),
+                'jq_support': jq_support,
+                'playwright_enabled': os.getenv('PLAYWRIGHT_DRIVER_URL', False),
+                'app_rss_token': app_rss_token,
+                'rss_uuid_feed' : {
+                    'label': watch.label,
+                    'url': url_for('rss.rss_single_watch', uuid=watch['uuid'], token=app_rss_token)
+                },
+                'settings_application': datastore.data['settings']['application'],
+                'ui_edit_stats_extras': collect_ui_edit_stats_extras(watch),
+                'visual_selector_data_ready': datastore.visualselector_data_is_ready(watch_uuid=uuid),
+                'timezone_default_config': datastore.data['settings']['application'].get('scheduler_timezone_default'),
+                'using_global_webdriver_wait': not default['webdriver_delay'],
+                'uuid': uuid,
+                'watch': watch,
+                'capabilities': capabilities,
+                'auto_applied_tags': {
+                    tag_uuid: tag
+                    for tag_uuid, tag in datastore.data['settings']['application']['tags'].items()
+                    if tag_uuid not in watch.get('tags', []) and tag.matches_url(watch.get('url', ''))
+                },
+                # LLM intent context
+                'llm_configured': bool(_get_llm_config(datastore)),
+                'llm_group_overrides': _resolve_llm_group_overrides(watch, datastore),
+            }
+
+            included_content = None
+            extra_form_template = getattr(form, 'extra_form_template', lambda: None)()
+            if extra_form_template:
+                # Real template file on the Flask loader, so its text gets extracted for translation (#4612)
+                included_content = render_template(extra_form_template, **template_args)
+            elif form.extra_form_content():
+                # Legacy raw Jinja2 string from a third-party processor plugin
+                # So that the extra panels can access _helpers.html etc, we set the environment to load from templates/
+                # And then render the code from the module
+                templates_dir = str(importlib.resources.files("changedetectionio").joinpath('templates'))
+                env = Environment(loader=FileSystemLoader(templates_dir))
+                template = env.from_string(form.extra_form_content())
+                included_content = template.render(**template_args)
+
+            output = render_template("edit.html",
+                                     extra_tab_content=form.extra_tab_content() if form.extra_tab_content() else None,
+                                     extra_form_content=included_content,
+                                     plugin_request_settings=plugin_request_settings,
+                                     **template_args
+                                     )
+
+        return output
+
+    @edit_blueprint.route("/edit/<uuid_str:uuid>/get-html", methods=['GET'])
+    @login_optionally_required
+    def watch_get_latest_html(uuid):
+        from io import BytesIO
+        from flask import send_file
+        import brotli
+
+        if uuid == 'first':
+            uuid = list(datastore.data['watching'].keys()).pop()
+        watch = datastore.data['watching'].get(uuid)
+        if watch and watch.history.keys() and os.path.isdir(watch.data_dir):
+            latest_filename = list(watch.history.keys())[-1]
+            html_fname = os.path.join(watch.data_dir, f"{latest_filename}.html.br")
+            with open(html_fname, 'rb') as f:
+                if html_fname.endswith('.br'):
+                    # Read and decompress the Brotli file
+                    decompressed_data = brotli.decompress(f.read())
+                else:
+                    decompressed_data = f.read()
+
+            buffer = BytesIO(decompressed_data)
+
+            return send_file(buffer, as_attachment=True, download_name=f"{latest_filename}.html", mimetype='text/html')
+
+        # Return a 500 error
+        abort(500)
+
+    @edit_blueprint.route("/edit/<uuid_str:uuid>/get-data-package", methods=['GET'])
+    @login_optionally_required
+    def watch_get_data_package(uuid):
+        """Download all data for a single watch as a zip file"""
+        from io import BytesIO
+        from flask import send_file
+        import zipfile
+        from pathlib import Path
+        import datetime
+
+        watch = datastore.data['watching'].get(uuid)
+        if not watch:
+            abort(404)
+
+        # Create zip in memory
+        memory_file = BytesIO()
+
+        with zipfile.ZipFile(memory_file, 'w',
+                           compression=zipfile.ZIP_DEFLATED,
+                           compresslevel=8) as zipObj:
+
+            # Add the watch's JSON file if it exists
+            watch_json_path = os.path.join(watch.data_dir, 'watch.json')
+            if os.path.isfile(watch_json_path):
+                zipObj.write(watch_json_path,
+                           arcname=os.path.join(uuid, 'watch.json'),
+                           compress_type=zipfile.ZIP_DEFLATED,
+                           compresslevel=8)
+
+            # Add all files in the watch data directory
+            if os.path.isdir(watch.data_dir):
+                for f in Path(watch.data_dir).glob('*'):
+                    if f.is_file() and f.name != 'watch.json':  # Skip watch.json since we already added it
+                        zipObj.write(f,
+                                   arcname=os.path.join(uuid, f.name),
+                                   compress_type=zipfile.ZIP_DEFLATED,
+                                   compresslevel=8)
+
+        # Seek to beginning of file
+        memory_file.seek(0)
+
+        # Generate filename with timestamp
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = f"watch-data-{uuid[:8]}-{timestamp}.zip"
+
+        return send_file(memory_file,
+                        as_attachment=True,
+                        download_name=filename,
+                        mimetype='application/zip')
+
+    # Ajax callback
+    @edit_blueprint.route("/edit/<uuid_str:uuid>/preview-rendered", methods=['POST'])
+    @login_optionally_required
+    def watch_get_preview_rendered(uuid):
+        '''For when viewing the "preview" of the rendered text from inside of Edit'''
+        from flask import jsonify
+
+        if uuid == 'first':
+            uuid = list(datastore.data['watching'].keys()).pop()
+        from changedetectionio.processors.text_json_diff import prepare_filter_prevew
+        result = prepare_filter_prevew(watch_uuid=uuid, form_data=request.form, datastore=datastore)
+        return jsonify(result)
+
+    @edit_blueprint.route("/highlight_submit_ignore_url", methods=['POST'])
+    @login_optionally_required
+    def highlight_submit_ignore_url():
+        import re
+        mode = request.form.get('mode')
+        selection = request.form.get('selection')
+
+        uuid = request.args.get('uuid','')
+        if datastore.data["watching"].get(uuid):
+            # Build the new list and REBIND it. Appending in place bypasses
+            # watch_base.__setitem__, so the watch is never flagged as edited and
+            # the "content unchanged since last check" skip stays active — the new
+            # ignore_text would then not take effect until the page changed on its
+            # own. Assigning the key marks the watch edited and forces reprocessing.
+            ignore_text = list(datastore.data["watching"][uuid]['ignore_text'])
+            if mode == 'exact':
+                for l in selection.splitlines():
+                    ignore_text.append(l.strip())
+            elif mode == 'digit-regex':
+                for l in selection.splitlines():
+                    # Replace any series of numbers with a regex
+                    s = re.escape(l.strip())
+                    s = re.sub(r'[0-9]+', r'\\d+', s)
+                    ignore_text.append('/' + s + '/')
+            datastore.data["watching"][uuid]['ignore_text'] = ignore_text
+
+            # Save the updated ignore_text
+            datastore.data["watching"][uuid].commit()
+
+        return f"<a href={url_for('ui.ui_preview.preview_page', uuid=uuid)}>Click to preview</a>"
+    
+    return edit_blueprint

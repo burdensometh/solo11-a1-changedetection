@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+
+import time
+import os
+
+from flask import url_for
+from .util import live_server_setup, wait_for_all_checks, delete_all_watches
+
+
+
+
+def _runner_test_http_errors(client, live_server, http_code, expected_text, datastore_path):
+
+    with open(os.path.join(datastore_path, "endpoint-content.txt"), "w") as f:
+        f.write("Now you going to get a {} error code\n".format(http_code))
+
+
+    # Add our URL to the import page
+    test_url = url_for('test_endpoint',
+                       status_code=http_code,
+                       _external=True)
+
+    uuid = client.application.config.get('DATASTORE').add_watch(url=test_url)
+    client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
+
+    # Give the thread time to pick it up
+    wait_for_all_checks(client)
+
+    res = client.get(url_for("watchlist.index"))
+    # no change
+    assert b'has-unread-changes' not in res.data
+    assert bytes(expected_text.encode('utf-8')) in res.data
+
+
+    # Error viewing tabs should appear
+    res = client.get(
+        url_for("ui.ui_preview.preview_page", uuid="first"),
+        follow_redirects=True
+    )
+
+    assert b'Error Text' in res.data
+
+    # 'Error Screenshot' only when in playwright mode
+    #assert b'Error Screenshot' in res.data
+
+
+    delete_all_watches(client)
+
+
+def test_http_error_handler(client, live_server, measure_memory_usage, datastore_path):
+    _runner_test_http_errors(client, live_server, 403, 'Access denied', datastore_path=datastore_path)
+    _runner_test_http_errors(client, live_server, 404, 'Page not found', datastore_path=datastore_path)
+    _runner_test_http_errors(client, live_server, 500, '(Internal server error) received', datastore_path=datastore_path)
+    _runner_test_http_errors(client, live_server, 400, 'Error - Request returned a HTTP error code 400', datastore_path=datastore_path)
+    delete_all_watches(client)
+
+# Just to be sure error text is properly handled
+def test_DNS_errors(client, live_server, measure_memory_usage, datastore_path):
+
+    # Add our URL to the import page
+    res = client.post(
+        url_for("imports.import_page"),
+        data={"urls": "https://errorfuldomainthatnevereallyexists12356.com"},
+        follow_redirects=True
+    )
+    assert b"1 Imported" in res.data
+    res = client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
+
+    # Give the thread time to pick it up
+    wait_for_all_checks(client)
+
+    res = client.get(url_for("watchlist.index"))
+    found_name_resolution_error = (
+        b"No address found" in res.data or
+        b"Name or service not known" in res.data or
+        b"nodename nor servname provided" in res.data or
+        b"Temporary failure in name resolution" in res.data or
+        b"Failed to establish a new connection" in res.data or
+        b"Connection error occurred" in res.data
+    )
+    assert found_name_resolution_error
+    # Should always record that we tried
+    assert "just now".encode('utf-8') in res.data or 'seconds ago'.encode('utf-8') in res.data
+    delete_all_watches(client)
+
+# Re 1513
+def test_low_level_errors_clear_correctly(client, live_server, measure_memory_usage, datastore_path):
+
+    with open(os.path.join(datastore_path, "endpoint-content.txt"), "w") as f:
+        f.write("<html><body><div id=here>Hello world</div></body></html>")
+
+    # Add our URL to the import page
+    test_url = url_for('test_endpoint', _external=True)
+
+    res = client.post(
+        url_for("imports.import_page"),
+        data={"urls": "https://dfkjasdkfjaidjfsdajfksdajfksdjfDOESNTEXIST.com"},
+        follow_redirects=True
+    )
+    assert b"1 Imported" in res.data
+    wait_for_all_checks(client)
+
+    # We should see the DNS error
+    res = client.get(url_for("watchlist.index"))
+    found_name_resolution_error = (
+        b"No address found" in res.data or
+        b"Name or service not known" in res.data or
+        b"nodename nor servname provided" in res.data or
+        b"Temporary failure in name resolution" in res.data or
+        b"Failed to establish a new connection" in res.data or
+        b"Connection error occurred" in res.data
+    )
+    assert found_name_resolution_error
+
+    # Update with what should work
+    client.post(
+        url_for("ui.ui_edit.edit_page", uuid="first"),
+        data={
+            "url": test_url,
+            "fetch_backend": "html_requests",
+            "time_between_check_use_default": "y"},
+        follow_redirects=True
+    )
+
+    # Now the error should be gone
+    wait_for_all_checks(client)
+    res = client.get(url_for("watchlist.index"))
+    found_name_resolution_error = (
+        b"No address found" in res.data or
+        b"Name or service not known" in res.data or
+        b"nodename nor servname provided" in res.data or
+        b"Temporary failure in name resolution" in res.data or
+        b"Failed to establish a new connection" in res.data or
+        b"Connection error occurred" in res.data
+    )
+    assert not found_name_resolution_error
+
+    delete_all_watches(client)
+
+
+def test_non200_records_last_check_status(client, live_server, measure_memory_usage, datastore_path):
+    # A watch that was fine (200) and then starts getting 403 must not keep reporting the old 200
+    with open(os.path.join(datastore_path, "endpoint-content.txt"), "w") as f:
+        f.write("<html><body>Hello world</body></html>")
+
+    datastore = client.application.config.get('DATASTORE')
+    uuid = datastore.add_watch(url=url_for('test_endpoint', _external=True))
+    client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
+    wait_for_all_checks(client)
+
+    watch = datastore.data['watching'][uuid]
+    assert watch.get('last_check_status') == 200
+    assert not watch.get('last_error')
+
+    datastore.update_watch(uuid=uuid, update_obj={'url': url_for('test_endpoint', status_code=403, _external=True)})
+    client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
+    wait_for_all_checks(client)
+
+    watch = datastore.data['watching'][uuid]
+    assert watch.get('last_check_status') == 403
+    assert 'Access denied' in watch.get('last_error')
+
+    delete_all_watches(client)
+
+
+def test_no_text_records_last_check_status(client, live_server, measure_memory_usage, datastore_path):
+    # Same as above but for ReplyWithContentButNoText, a page that renders no text must not keep reporting the old 200
+    with open(os.path.join(datastore_path, "endpoint-content.txt"), "w") as f:
+        f.write("<html><body>Hello world</body></html>")
+
+    datastore = client.application.config.get('DATASTORE')
+    uuid = datastore.add_watch(url=url_for('test_endpoint', _external=True))
+    client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
+    wait_for_all_checks(client)
+
+    watch = datastore.data['watching'][uuid]
+    assert watch.get('last_check_status') == 200
+
+    # ignore_status_codes lets the 500 through to the processor, which then finds no text
+    datastore.update_watch(uuid=uuid, update_obj={'ignore_status_codes': True,
+                                                  'url': url_for('test_endpoint', status_code=500, content='<html><body></body></html>', _external=True)})
+    client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
+    wait_for_all_checks(client)
+
+    watch = datastore.data['watching'][uuid]
+    assert watch.get('last_check_status') == 500
+    assert 'Got HTML content but no text found (With 500 reply code)' in watch.get('last_error')
+
+    delete_all_watches(client)

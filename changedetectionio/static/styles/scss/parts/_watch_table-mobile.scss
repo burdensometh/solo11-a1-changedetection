@@ -1,0 +1,207 @@
+$grid-col-checkbox: 40px;
+$grid-col-watch: 100px;
+$grid-gap: 0.5rem;
+
+// Breakpoint at which the watch list snaps from horizontal table rows to the
+// stacked mobile grid layout. The min-width companion (= max + 1px) handles
+// the desktop-only side so the two queries can never overlap or leave a 1px
+// gap between them.
+$watch-table-mobile-max: 767px;
+
+
+@media (max-width: $watch-table-mobile-max) {
+
+  /*
+  Max width before this PARTICULAR table gets nasty
+  This query will take effect for any screen smaller than 760px
+  and also iPads specifically.
+  */
+  .watch-table {
+    /* make headings work on mobile */
+    thead {
+      display: block;
+
+      tr {
+        th {
+          display: inline-block;
+          // Hide the "Last" text for smaller screens — the parent
+          // @media already gates this to the mobile breakpoint.
+          .hide-on-mobile {
+            display: none;
+          }
+        }
+      }
+
+      .empty-cell {
+        display: none;
+      }
+    }
+
+    .last-checked::before {
+      color: var(--color-text);
+      content: attr(data-label) " ";
+    }
+
+    .last-changed::before {
+      color: var(--color-text);
+      content: attr(data-label) " ";
+    }
+
+    /* Force table to not be like tables anymore */
+    td.inline {
+      display: inline-block;
+    }
+
+    .pure-table td,
+    .pure-table th {
+      border: none;
+    }
+
+    td {
+      /* Behave  like a "row" */
+      border: none;
+      border-bottom: 1px solid var(--color-border-watch-table-cell);
+      vertical-align: middle;
+
+      &:before {
+        /* Top/left values mimic padding */
+        top: 6px;
+        left: 6px;
+        width: 45%;
+        padding-right: 10px;
+        white-space: nowrap;
+      }
+    }
+
+    &.pure-table-striped {
+      tr {
+        background-color: var(--color-table-background);
+      }
+
+      tr:nth-child(2n-1) {
+        background-color: var(--color-table-stripe);
+      }
+
+      tr:nth-child(2n-1) td {
+        background-color: inherit;
+      }
+    }
+  }
+}
+/* watch table snap to stacked horizontal */
+@media (max-width: $watch-table-mobile-max) {
+  .blueprint-watchlist {
+    #mobile-home {
+      opacity: 0.5;
+    }
+  }
+  #mobile-home {
+    /* Basic little home button for mobile so we dont feel lost */
+    display: inline-block !important;
+  }
+  #menu-mute {
+    span {
+      display: none;
+    }
+  }
+  .watch-table {
+    border: none;
+  // Row hover highlight (the app's tables don't zebra-stripe).
+
+    tbody {
+      tr {
+        &:hover > td {
+          background-color: inherit !important;
+        }
+        padding-inline: 12px;
+        padding-top: 12px;
+        padding-bottom: 12px;
+        margin-bottom: 1rem;
+        display: grid;
+        grid-template-columns: $grid-col-checkbox 1fr $grid-col-watch;
+        grid-template-rows: auto auto auto auto;
+        gap: $grid-gap;
+
+        .counter-i {
+          display: none;
+        }
+
+        td.inline {
+          /* display: block !important;;*/
+        }
+
+        > td {
+          border-bottom: none;
+        }
+
+        // Empty state message - span full width on mobile
+        > td[colspan] {
+          grid-column: 1 / -1;
+        }
+
+        > td.title-col {
+          grid-column: 1 / -1;
+          grid-row: 1;
+          .watch-title {
+            font-size: 0.92rem;
+          }
+          .link-spread {
+            display: none;
+          }
+        }
+
+        > td.last-checked {
+          grid-column: 1 / -1;
+          grid-row: 2;
+        }
+
+        > td.last-changed {
+          grid-column: 1 / -1;
+          grid-row: 3;
+        }
+
+        > td.checkbox-uuid {
+          grid-column: 1;
+          grid-row: 4;
+        }
+
+        > td.buttons {
+          grid-column: 2;
+          grid-row: 4;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+
+        > td.watch-controls {
+          grid-column: 3;
+          grid-row: 4;
+          display: grid;
+          place-items: center;
+
+          a img {
+            padding: 10px;
+          }
+        }
+      }
+    }
+  }
+  .pure-table td {
+    padding: 0 !important;
+  }
+}
+
+@media (min-width: $watch-table-mobile-max + 1px) {
+  .watch-table thead tr th .hide-on-desktop {
+    display: none;
+  }
+  .watch-table {
+    td.last-checked, td.last-changed {
+      .innertext {
+        white-space: nowrap;
+      }
+    }
+  }
+}
+
+

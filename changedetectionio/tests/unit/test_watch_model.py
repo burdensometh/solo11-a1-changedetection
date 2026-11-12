@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+
+# run from dir above changedetectionio/ dir
+# python3 -m unittest changedetectionio.tests.unit.test_notification_diff
+
+import unittest
+import os
+import time
+import glob
+import base64
+import pickle
+import tempfile
+from copy import deepcopy
+
+from changedetectionio.model import Watch, Tag
+
+# mostly
+class TestDiffBuilder(unittest.TestCase):
+
+    def test_watch_get_suggested_from_diff_timestamp(self):
+        import uuid as uuid_builder
+        # Create minimal mock datastore for tests
+        mock_datastore = {
+            'settings': {
+                'application': {}
+            },
+            'watching': {}
+        }
+        watch = Watch.model(datastore_path='/tmp', __datastore=mock_datastore, default={})
+        watch.ensure_data_dir_exists()
+
+
+        # Contents from the browser are always returned from the browser/requests/etc as str, str is basically UTF-16 in python
+        watch.save_history_blob(contents="hello world", timestamp=100, snapshot_id=str(uuid_builder.uuid4()))
+        watch.save_history_blob(contents="hello world", timestamp=105, snapshot_id=str(uuid_builder.uuid4()))
+        watch.save_history_blob(contents="hello world", timestamp=109, snapshot_id=str(uuid_builder.uuid4()))
+        watch.save_history_blob(contents="hello world", timestamp=112, snapshot_id=str(uuid_builder.uuid4()))
+        watch.save_history_blob(contents="hello world", timestamp=115, snapshot_id=str(uuid_builder.uuid4()))
+        watch.save_history_blob(contents="hello world", timestamp=117, snapshot_id=str(uuid_builder.uuid4()))
+    
+        p = watch.get_from_version_based_on_last_viewed
+        assert p == "100", "Correct 'last viewed' timestamp was detected"
+
+        watch['last_viewed'] = 110
+        p = watch.get_from_version_based_on_last_viewed
+        assert p == "109", "Correct 'last viewed' timestamp was detected"
+
+        watch['last_viewed'] = 116
+        p = watch.get_from_version_based_on_last_viewed
+        assert p == "115", "Correct 'last viewed' timestamp was detected"
+
+        watch['last_viewed'] = 99
+        p = watch.get_from_version_based_on_last_viewed
+        assert p == "100", "When the 'last viewed' timestamp is less than the oldest snapshot, return oldest"
+
+        watch['last_viewed'] = 200
+        p = watch.get_from_version_based_on_last_viewed
+        assert p == "115", "When the 'last viewed' timestamp is greater than the newest snapshot, return second newest"
+
+        watch['last_viewed'] = 109
+        p = watch.get_from_version_based_on_last_viewed
+        assert p == "109", "Correct when its the same time"
+
+        # new empty one
+        watch = Watch.model(datastore_path='/tmp', __datastore=mock_datastore, default={})
+        p = watch.get_from_version_based_on_last_viewed
+        assert p == None, "None when no history available"
+
+        watch.save_history_blob(contents="hello world", timestamp=100, snapshot_id=str(uuid_builder.uuid4()))
+        p = watch.get_from_version_based_on_last_viewed
+        assert p == "100", "Correct with only one history snapshot"
+
+        watch['last_viewed'] = 200
+        p = watch.get_from_version_based_on_last_viewed
+        assert p == "100", "Correct with only one history snapshot"
+
+    def test_watch_deepcopy_doesnt_copy_datastore(self):
+        """
+        CRITICAL: Ensure deepcopy(watch) shares __datastore instead of copying it.
+
+        Without this, deepcopy causes exponential memory growth:
+        - 100 watches × deepcopy each = 10,000 watch objects in memory (100²)
+        - Memory grows from 120MB → 2GB
+
+        This test prevents regressions in the __deepcopy__ implementation.
+        """
+        # Create mock datastore with multiple watches
+        mock_datastore = {
+            'settings': {'application': {'history_snapshot_max_length': 10}},
+            'watching': {}
+        }
+
+        # Create 3 watches that all reference the same datastore
+        watches = []
+        for i in range(3):
+            watch = Watch.model(
+                __datastore=mock_datastore,
+                datastore_path='/tmp/test',
+                default={'url': f'https://example{i}.com', 'title': f'Watch {i}'}
+            )
+            mock_datastore['watching'][watch['uuid']] = watch
+            watches.append(watch)
+
+        # Test 1: Deepcopy shares datastore reference (doesn't copy it)
+        watch_copy = deepcopy(watches[0])
+
+        self.assertIsNotNone(watch_copy._datastore,
+                            "__datastore should exist in copied watch")
+        self.assertIs(watch_copy._datastore, watches[0]._datastore,
+                     "__datastore should be SHARED (same object), not copied")
+        self.assertIs(watch_copy._datastore, mock_datastore,
+                     "__datastore should reference the original datastore")
+
+        # Test 2: Dict data is properly copied (not shared)
+        self.assertEqual(watch_copy['title'], 'Watch 0', "Dict data should be copied")
+        watch_copy['title'] = 'MODIFIED'
+        self.assertNotEqual(watches[0]['title'], 'MODIFIED',
+                           "Modifying copy should not affect original")
+
+        # Test 3: Verify no nested datastore copies in watch dict
+        # The dict should only contain watch settings, not the datastore
+        watch_dict = dict(watch_copy)
+        self.assertNotIn('__datastore', watch_dict,
+                        "__datastore should not be in dict keys")
+        self.assertNotIn('_model__datastore', watch_dict,
+                        "_model__datastore should not be in dict keys")
+
+        # Test 4: Multiple deepcopies don't cause exponential memory growth
+        # If datastore was copied, each copy would contain 3 watches,
+        # and those watches would contain the datastore, etc. (infinite recursion)
+        copies = []
+        for _ in range(5):
+            copies.append(deepcopy(watches[0]))
+
+        # All copies should share the same datastore
+        for copy in copies:
+            self.assertIs(copy._datastore, mock_datastore,
+                         "All copies should share the original datastore")
+
+    def test_watch_pickle_doesnt_serialize_datastore(self):
+        """
+        Ensure pickle/unpickle doesn't serialize __datastore.
+
+        This is important for multiprocessing and caching - we don't want
+        to serialize the entire datastore when pickling a watch.
+        """
+        mock_datastore = {
+            'settings': {'application': {}},
+            'watching': {}
+        }
+
+        watch = Watch.model(
+            __datastore=mock_datastore,
+            datastore_path='/tmp/test',
+            default={'url': 'https://example.com', 'title': 'Test Watch'}
+        )
+
+        # Pickle and unpickle
+        pickled = pickle.dumps(watch)
+        unpickled_watch = pickle.loads(pickled)
+
+        # Test 1: Watch data is preserved
+        self.assertEqual(unpickled_watch['url'], 'https://example.com',
+                        "Dict data should be preserved after pickle/unpickle")
+
+        # Test 2: __datastore is NOT serialized (attribute shouldn't exist after unpickle)
+        self.assertFalse(hasattr(unpickled_watch, '_datastore'),
+                         "__datastore attribute should not exist after unpickle (not serialized)")
+
+        # Test 3: Pickled data shouldn't contain the large datastore object
+        # If datastore was serialized, the pickle size would be much larger
+        pickle_size = len(pickled)
+        # A single watch should be small (< 10KB), not include entire datastore
+        self.assertLess(pickle_size, 10000,
+                       f"Pickled watch too large ({pickle_size} bytes) - might include datastore")
+
+    def test_tag_deepcopy_works(self):
+        """
+        Ensure Tag objects (which also inherit from watch_base) can be deepcopied.
+
+        Tags now have optional __datastore for consistency with Watch objects.
+        """
+        mock_datastore = {
+            'settings': {'application': {}},
+            'watching': {}
+        }
+
+        # Test 1: Tag without datastore (backward compatibility)
+        tag_without_ds = Tag.model(
+            datastore_path='/tmp/test',
+            default={'title': 'Test Tag', 'overrides_watch': True}
+        )
+        tag_copy1 = deepcopy(tag_without_ds)
+        self.assertEqual(tag_copy1['title'], 'Test Tag', "Tag data should be copied")
+
+        # Test 2: Tag with datastore (new pattern for consistency)
+        tag_with_ds = Tag.model(
+            datastore_path='/tmp/test',
+            __datastore=mock_datastore,
+            default={'title': 'Test Tag With DS', 'overrides_watch': True}
+        )
+
+        # Deepcopy should work
+        tag_copy2 = deepcopy(tag_with_ds)
+
+        # Test 3: Dict data is copied
+        self.assertEqual(tag_copy2['title'], 'Test Tag With DS', "Tag data should be copied")
+
+        # Test 4: Modifications to copy don't affect original
+        tag_copy2['title'] = 'MODIFIED'
+        self.assertNotEqual(tag_with_ds['title'], 'MODIFIED',
+                           "Modifying copy should not affect original")
+
+        # Test 5: Tag with datastore shares it (doesn't copy it)
+        if hasattr(tag_with_ds, '_datastore'):
+            self.assertIs(tag_copy2._datastore, tag_with_ds._datastore,
+                         "Tag should share __datastore reference like Watch does")
+
+    def test_watch_copy_performance(self):
+        """
+        Verify that our __deepcopy__ implementation doesn't cause performance issues.
+
+        With the fix, deepcopy should be fast because we're sharing datastore
+        instead of copying it.
+        """
+        import time
+
+        # Create a watch with large datastore (many watches)
+        mock_datastore = {
+            'settings': {'application': {}},
+            'watching': {}
+        }
+
+        # Add 100 watches to the datastore
+        for i in range(100):
+            w = Watch.model(
+                __datastore=mock_datastore,
+                datastore_path='/tmp/test',
+                default={'url': f'https://example{i}.com'}
+            )
+            mock_datastore['watching'][w['uuid']] = w
+
+        # Time how long deepcopy takes
+        watch = list(mock_datastore['watching'].values())[0]
+
+        start = time.time()
+        for _ in range(10):
+            _ = deepcopy(watch)
+        elapsed = time.time() - start
+
+        # Should be fast (< 0.1 seconds for 10 copies)
+        # If datastore was copied, it would take much longer
+        self.assertLess(elapsed, 0.5,
+                       f"Deepcopy too slow ({elapsed:.3f}s for 10 copies) - might be copying datastore")
+
+
+class TestFaviconFilenameCache(unittest.TestCase):
+
+    def test_clear_watch_invalidates_cached_favicon_filename(self):
+        from changedetectionio.model.Watch import _FAVICON_FILENAME_CACHE
+
+        mock_datastore = {'settings': {'application': {}}, 'watching': {}}
+
+        with tempfile.TemporaryDirectory() as datastore_path:
+            watch = Watch.model(
+                datastore_path=datastore_path,
+                __datastore=mock_datastore,
+                default={'url': 'https://example.com'}
+            )
+            watch.ensure_data_dir_exists()
+            self.addCleanup(_FAVICON_FILENAME_CACHE.pop, watch.data_dir, None)
+
+            favicon_path = os.path.join(watch.data_dir, 'favicon.ico')
+            with open(favicon_path, 'wb') as favicon_file:
+                favicon_file.write(b'favicon')
+
+            self.assertEqual(watch.get_favicon_filename(), 'favicon.ico')
+
+            watch.clear_watch()
+
+            self.assertFalse(os.path.exists(favicon_path))
+            self.assertIsNone(watch.get_favicon_filename())
+
+
+class TestFaviconExpiry(unittest.TestCase):
+    """favicon_is_expired() must judge the icon the watch actually has now."""
+
+    def _watch(self, datastore_path):
+        from changedetectionio.model.Watch import _FAVICON_FILENAME_CACHE
+        watch = Watch.model(
+            datastore_path=datastore_path,
+            __datastore={'settings': {'application': {}}, 'watching': {}},
+            default={'url': 'https://example.com'}
+        )
+        watch.ensure_data_dir_exists()
+        self.addCleanup(_FAVICON_FILENAME_CACHE.pop, watch.data_dir, None)
+        return watch
+
+    def test_fresh_favicon_wins_over_a_stale_one_of_another_extension(self):
+        """A leftover favicon.<other ext> must not force a refetch on every check.
+
+        bump_favicon() names the file after the icon's type, so a watch whose icon changed
+        type could hold two. glob order is decided by filename hash, so picking the first
+        match meant some extension pairs always chose the stale file - the age check failed
+        every time and the favicon was refetched forever.
+        """
+        with tempfile.TemporaryDirectory() as datastore_path:
+            watch = self._watch(datastore_path)
+
+            stale = os.path.join(watch.data_dir, 'favicon.png')
+            with open(stale, 'wb') as f:
+                f.write(b'stale')
+            old = time.time() - (40 * 86400)
+            os.utime(stale, (old, old))
+
+            fresh = os.path.join(watch.data_dir, 'favicon.ico')
+            with open(fresh, 'wb') as f:
+                f.write(b'fresh')
+
+            self.assertFalse(watch.favicon_is_expired(),
+                             "a favicon saved seconds ago must not count as expired just "
+                             "because an older one of a different extension is also present")
+
+    def test_expired_when_the_newest_favicon_is_old(self):
+        with tempfile.TemporaryDirectory() as datastore_path:
+            watch = self._watch(datastore_path)
+            path = os.path.join(watch.data_dir, 'favicon.ico')
+            with open(path, 'wb') as f:
+                f.write(b'old')
+            old = time.time() - (40 * 86400)
+            os.utime(path, (old, old))
+
+            self.assertTrue(watch.favicon_is_expired())
+
+    def test_no_favicon_file_is_expired_and_does_not_raise(self):
+        """The filename cache can say yes after the file is gone; that is a refetch, not an error."""
+        from changedetectionio.model.Watch import _FAVICON_FILENAME_CACHE
+        with tempfile.TemporaryDirectory() as datastore_path:
+            watch = self._watch(datastore_path)
+            _FAVICON_FILENAME_CACHE[watch.data_dir] = 'favicon.ico'   # stale positive
+
+            self.assertTrue(watch.favicon_is_expired())
+
+    def test_bump_favicon_removes_the_superseded_file(self):
+        with tempfile.TemporaryDirectory() as datastore_path:
+            watch = self._watch(datastore_path)
+            previous = os.path.join(watch.data_dir, 'favicon.ico')
+            with open(previous, 'wb') as f:
+                f.write(b'previous')
+
+            watch.bump_favicon(url='https://example.com/icon.png',
+                               favicon_base_64=base64.b64encode(b'newicon').decode(),
+                               mime_type='image/png')
+
+            remaining = sorted(os.path.basename(x) for x in
+                               glob.glob(os.path.join(watch.data_dir, 'favicon.*')))
+            self.assertEqual(remaining, ['favicon.png'],
+                             "the old favicon.ico should have been removed")
+
+    def _save_favicon(self, watch):
+        watch.bump_favicon(url='https://example.com/icon.png',
+                           favicon_base_64=base64.b64encode(b'icon').decode(),
+                           mime_type='image/png')
+        self.assertEqual(watch.get_favicon_filename(), 'favicon.png')
+
+    def test_url_change_clears_favicon(self):
+        """#4569 - the old site's icon must not outlive a URL change."""
+        with tempfile.TemporaryDirectory() as datastore_path:
+            watch = self._watch(datastore_path)
+            self._save_favicon(watch)
+
+            watch.update({'url': 'https://another-site.com'})
+
+            self.assertEqual(glob.glob(os.path.join(watch.data_dir, 'favicon.*')), [])
+            self.assertIsNone(watch.get_favicon_filename())
+            self.assertTrue(watch.favicon_is_expired())
+
+    def test_same_url_or_other_fields_keep_favicon(self):
+        with tempfile.TemporaryDirectory() as datastore_path:
+            watch = self._watch(datastore_path)
+            self._save_favicon(watch)
+
+            watch.update({'url': ' https://example.com '})   # same URL, only whitespace differs
+            watch.update({'title': 'Renamed'})
+
+            self.assertEqual(watch.get_favicon_filename(), 'favicon.png')
+
+    def test_loading_a_watch_from_storage_keeps_favicon(self):
+        """A fresh object starts with url '' and is filled via update(); that is not a URL change."""
+        with tempfile.TemporaryDirectory() as datastore_path:
+            watch = self._watch(datastore_path)
+            self._save_favicon(watch)
+
+            reloaded = Watch.model(
+                datastore_path=datastore_path,
+                __datastore={'settings': {'application': {}}, 'watching': {}},
+                default=dict(watch)
+            )
+            self.assertEqual(reloaded.data_dir, watch.data_dir)
+            self.assertEqual(reloaded.get_favicon_filename(), 'favicon.png')
+            deepcopy(reloaded)
+            self.assertTrue(os.path.isfile(os.path.join(watch.data_dir, 'favicon.png')))
+
+
+class TestLLMDiffSummaryCache(unittest.TestCase):
+    """Tests for get_llm_diff_summary / save_llm_diff_summary — version-pair + prompt-hash caching."""
+
+    PROMPT = 'List what changed as bullet points'
+
+    def _make_watch(self):
+        mock_datastore = {'settings': {'application': {}}, 'watching': {}}
+        watch = Watch.model(datastore_path='/tmp', __datastore=mock_datastore, default={})
+        watch.ensure_data_dir_exists()
+        return watch
+
+    def test_returns_empty_when_no_file_exists(self):
+        watch = self._make_watch()
+        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == ''
+
+    def test_save_and_retrieve(self):
+        watch = self._make_watch()
+        watch.save_llm_diff_summary('Price dropped to $199', '1000', '2000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == 'Price dropped to $199'
+
+    def test_different_version_pairs_are_independent(self):
+        watch = self._make_watch()
+        watch.save_llm_diff_summary('Summary A', '1000', '2000', prompt=self.PROMPT)
+        watch.save_llm_diff_summary('Summary B', '2000', '3000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == 'Summary A'
+        assert watch.get_llm_diff_summary('2000', '3000', prompt=self.PROMPT) == 'Summary B'
+
+    def test_unknown_pair_returns_empty(self):
+        watch = self._make_watch()
+        watch.save_llm_diff_summary('Summary A', '1000', '2000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary('9999', '8888', prompt=self.PROMPT) == ''
+
+    def test_changed_prompt_is_a_cache_miss(self):
+        """Changing the prompt must invalidate the cached summary for the same version pair."""
+        watch = self._make_watch()
+        watch.save_llm_diff_summary('Old summary', '1000', '2000', prompt='original prompt')
+        # Different prompt → different hash → different filename → miss
+        assert watch.get_llm_diff_summary('1000', '2000', prompt='new different prompt') == ''
+
+    def test_file_named_by_versions_and_prompt_hash(self):
+        """Cache file must be named change-summary-{from}-to-{to}-{hash}.txt."""
+        import hashlib
+        watch = self._make_watch()
+        prompt = 'my summary prompt'
+        watch.save_llm_diff_summary('Test summary', '1776000000', '1776001000', prompt=prompt)
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()[:8]
+        expected_path = os.path.join(
+            watch.data_dir,
+            f'change-summary-1776000000-to-1776001000-{prompt_hash}.txt'
+        )
+        assert os.path.isfile(expected_path), \
+            f"Expected cache file not found: {expected_path}"
+        with open(expected_path, 'r') as f:
+            assert f.read().strip() == 'Test summary'
+
+    def test_overwrite_same_pair_and_prompt(self):
+        watch = self._make_watch()
+        watch.save_llm_diff_summary('First summary', '1000', '2000', prompt=self.PROMPT)
+        watch.save_llm_diff_summary('Updated summary', '1000', '2000', prompt=self.PROMPT)
+        assert watch.get_llm_diff_summary('1000', '2000', prompt=self.PROMPT) == 'Updated summary'
+
+
+class TestHistoryPathTraversal(unittest.TestCase):
+    """GHSA-8757-69j2-hx56: history.txt must not allow reads outside the watch data dir."""
+
+    def _make_watch(self):
+        mock_datastore = {'settings': {'application': {}}, 'watching': {}}
+        watch = Watch.model(datastore_path='/tmp', __datastore=mock_datastore, default={})
+        watch.ensure_data_dir_exists()
+        return watch
+
+    def _write_history_txt(self, watch, lines):
+        """Directly write raw lines to history.txt to simulate a restored backup."""
+        fname = os.path.join(watch.data_dir, watch.history_index_filename)
+        with open(fname, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+
+    def test_absolute_path_in_history_is_rejected(self):
+        """An absolute path like /etc/passwd must not appear in history."""
+        watch = self._make_watch()
+        self._write_history_txt(watch, ['1000000000,/etc/passwd\n'])
+        history = watch.history
+        self.assertEqual(history, {}, "Absolute path entry must be rejected")
+
+    def test_traversal_path_in_history_is_rejected(self):
+        """A relative traversal path like ../../etc/passwd must not appear in history."""
+        watch = self._make_watch()
+        self._write_history_txt(watch, ['1000000000,../../etc/passwd\n'])
+        history = watch.history
+        self.assertEqual(history, {}, "Path traversal entry must be rejected")
+
+    def test_parent_dir_entry_is_rejected_by_the_containment_check(self):
+        """A bare '..' is the shortest entry that reaches and fails the containment check.
+
+        os.path.basename() reduces '/etc/passwd' and '../../etc/passwd' to
+        'passwd', so those two stop at the os.path.exists() check below the
+        guard rather than at the guard itself. '..' survives basename() intact
+        and resolves to the parent of data_dir, which does exist, so the
+        containment check is what rejects it. Not the only such input —
+        '../..' and 'foo/..' collapse to the same thing — and not the only
+        reason the check exists: it also blocks a filename inside data_dir
+        that is itself a symlink pointing outside.
+        """
+        watch = self._make_watch()
+        self._write_history_txt(watch, ['1000000000,..\n'])
+        history = watch.history
+        self.assertEqual(history, {}, "Parent-directory entry must be rejected")
+
+    def test_normal_snapshot_entry_is_accepted(self):
+        """A bare filename written by save_history_blob must still load correctly."""
+        import uuid as uuid_builder
+        watch = self._make_watch()
+        watch.save_history_blob(contents="hello world", timestamp=1000000000, snapshot_id=str(uuid_builder.uuid4()))
+        history = watch.history
+        self.assertEqual(len(history), 1, "Normal snapshot entry must be accepted")
+        # Watch.history resolves entries with os.path.realpath, so compare against a
+        # resolved data_dir. On macOS the datastore lives under /tmp, which is a symlink
+        # to /private/tmp, and an unresolved comparison fails there for a correct path.
+        self.assertTrue(
+            list(history.values())[0].startswith(os.path.realpath(watch.data_dir)),
+            "Resolved path must be inside the watch data directory"
+        )
+
+    def test_symlink_pointing_outside_data_dir_is_rejected(self):
+        """A plain-named entry that is a symlink to a file outside data_dir must be rejected."""
+        watch = self._make_watch()
+        with tempfile.NamedTemporaryFile(delete=False) as outside:
+            outside.write(b'secret')
+        try:
+            os.symlink(outside.name, os.path.join(watch.data_dir, 'evil.txt'))
+            self._write_history_txt(watch, ['1000000000,evil.txt\n'])
+            self.assertEqual(watch.history, {}, "Symlink escaping data_dir must be rejected")
+        finally:
+            os.unlink(outside.name)
+
+    def test_symlink_inside_data_dir_is_accepted(self):
+        """A symlink that resolves to a file inside data_dir is fine."""
+        watch = self._make_watch()
+        target = os.path.join(watch.data_dir, 'real.txt')
+        with open(target, 'w') as f:
+            f.write('hello')
+        os.symlink(target, os.path.join(watch.data_dir, 'link.txt'))
+        self._write_history_txt(watch, ['1000000000,link.txt\n'])
+        self.assertEqual(list(watch.history.values()), [os.path.realpath(target)])
+
+    def test_dangling_symlink_is_skipped(self):
+        watch = self._make_watch()
+        os.symlink(os.path.join(watch.data_dir, 'gone.txt'), os.path.join(watch.data_dir, 'dangling.txt'))
+        self._write_history_txt(watch, ['1000000000,dangling.txt\n'])
+        self.assertEqual(watch.history, {})
+
+    def test_missing_snapshot_and_junk_lines_are_skipped(self):
+        """Entries whose snapshot file is gone, blank and whitespace-only lines don't count."""
+        import uuid as uuid_builder
+        watch = self._make_watch()
+        watch.save_history_blob(contents="one", timestamp=1000000001, snapshot_id=str(uuid_builder.uuid4()))
+        watch.save_history_blob(contents="two", timestamp=1000000002, snapshot_id=str(uuid_builder.uuid4()))
+        fname = os.path.join(watch.data_dir, watch.history_index_filename)
+        with open(fname, 'a', encoding='utf-8') as f:
+            f.write('\n   \n1000000003,does-not-exist.txt\n\n')
+        self.assertEqual(list(watch.history.keys()), ['1000000001', '1000000002'])
+        self.assertEqual(watch.history_n, 2)
+        self.assertEqual(watch.newest_history_key, '1000000002')
+
+    def test_get_history_snapshot_blocks_outside_path_directly(self):
+        """get_history_snapshot(filepath=...) must raise if the path escapes data_dir."""
+        watch = self._make_watch()
+        with self.assertRaises(PermissionError):
+            watch.get_history_snapshot(filepath='/etc/passwd')
+
+    def test_get_history_snapshot_blocks_traversal_directly(self):
+        """get_history_snapshot(filepath=...) must raise on ../../ traversal paths."""
+        watch = self._make_watch()
+        with self.assertRaises(PermissionError):
+            watch.get_history_snapshot(filepath=os.path.join(watch.data_dir, '../../etc/passwd'))
+
+    def test_resolved_path_stays_inside_data_dir(self):
+        """All resolved history paths must reside within the watch's data_dir."""
+        import uuid as uuid_builder
+        watch = self._make_watch()
+        for ts in [1000000001, 1000000002, 1000000003]:
+            watch.save_history_blob(contents=f"content {ts}", timestamp=ts, snapshot_id=str(uuid_builder.uuid4()))
+        safe_dir = os.path.realpath(watch.data_dir)
+        for path in watch.history.values():
+            self.assertTrue(
+                os.path.realpath(path).startswith(safe_dir),
+                f"Path {path!r} escapes the watch data directory"
+            )
+
+
+class TestLinkToOpen(unittest.TestCase):
+    """`link_to_open` - the optional human-facing URL used instead of the watched URL."""
+
+    def _make_watch(self, **fields):
+        mock_datastore = {'settings': {'application': {}}, 'watching': {}}
+        return Watch.model(datastore_path='/tmp', __datastore=mock_datastore, default=fields)
+
+    def test_defaults_to_the_watched_url(self):
+        watch = self._make_watch(url='https://example.com/feed.xml')
+        assert watch.open_link_override == ''
+        assert watch.open_link == 'https://example.com/feed.xml'
+        assert watch.open_link == watch.link
+
+    def test_override_wins_when_set(self):
+        watch = self._make_watch(url='https://example.com/api/v1/items.json',
+                                 link_to_open='https://example.com/shop/items')
+        assert watch.link == 'https://example.com/api/v1/items.json'
+        assert watch.open_link == 'https://example.com/shop/items'
+        assert watch.open_link_override == 'https://example.com/shop/items'
+
+    def test_whitespace_only_override_is_ignored(self):
+        watch = self._make_watch(url='https://example.com/feed.xml', link_to_open='   ')
+        assert watch.open_link_override == ''
+        assert watch.open_link == 'https://example.com/feed.xml'
+
+    def test_unsafe_override_falls_back_to_the_watched_url(self):
+        watch = self._make_watch(url='https://example.com/feed.xml',
+                                 link_to_open='javascript:alert(1)')
+        assert watch.open_link_override == ''
+        assert watch.open_link == 'https://example.com/feed.xml'
+
+    def test_source_prefix_is_stripped_from_the_override(self):
+        watch = self._make_watch(url='source:https://example.com/feed.xml',
+                                 link_to_open='source:https://example.com/page')
+        assert watch.open_link == 'https://example.com/page'
+
+    def test_jinja2_in_the_override_is_rendered(self):
+        watch = self._make_watch(url='https://example.com/feed.xml',
+                                 link_to_open='https://example.com/page?id={{ 1+1 }}')
+        assert watch.open_link == 'https://example.com/page?id=2'
+
+
+if __name__ == '__main__':
+    unittest.main()

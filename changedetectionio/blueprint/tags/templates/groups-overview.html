@@ -1,0 +1,113 @@
+{% extends 'base.html' %}
+{% block content %}
+{% from '_helpers.html' import render_simple_field, render_field %}
+<script src="{{url_for('static_content', group='js', filename='jquery-3.6.0.min.js')}}"></script>
+<script src="{{url_for('static_content', group='js', filename='modal.js')}}"></script>
+<style>
+{%- for uuid, tag in available_tags -%}
+{%- if tag and tag.title -%}
+{%- set class_name = tag.title|sanitize_tag_class -%}
+{#- Anything but a hex colour would inject CSS rules here, fall back to the generated colour -#}
+{%- set tag_colour = tag.get('tag_colour')|safe_css_colour -%}
+{%- if tag_colour -%}
+.watch-tag-list.tag-{{ class_name }} { background-color: {{ tag_colour }}; color: {{ wcag_text_color(tag_colour) }}; }
+{%- else -%}
+{%- set colors = generate_tag_colors(tag.title) -%}
+.watch-tag-list.tag-{{ class_name }} {
+  background-color: {{ colors['light']['bg'] }};
+  color: {{ colors['light']['color'] }};
+}
+html[data-darkmode="true"] .watch-tag-list.tag-{{ class_name }} {
+  background-color: {{ colors['dark']['bg'] }};
+  color: {{ colors['dark']['color'] }};
+}
+@media (prefers-color-scheme: dark) {
+  html[data-darkmode="auto"] .watch-tag-list.tag-{{ class_name }} {
+    background-color: {{ colors['dark']['bg'] }};
+    color: {{ colors['dark']['color'] }};
+  }
+}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+</style>
+
+<div class="box">
+    <form class="pure-form" action="{{ url_for('tags.form_tag_add') }}" method="POST" id="new-watch-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" >
+        <fieldset>
+            <legend>{{ _('Add a new organisational tag / group name.') }}</legend>
+            <div id="watch-add-wrapper-zone">
+                <div>
+                    {{ render_simple_field(form.name, placeholder=_("Watch group / tag")) }}
+                </div>
+                <div>
+                    {{ render_simple_field(form.save_button, title=_("Save"), label=false ) }}
+                </div>
+            </div>
+            <br>
+            <div style="color: #fff;">{{ _('Groups allows you to manage filters and notifications for multiple watches under a single organisational tag.') }}</div>
+        </fieldset>
+    </form>
+    <!-- @todo maybe some overview matrix, 'tick' with which has notification, filter rules etc -->
+    <div id="watch-table-wrapper">
+        <div class="cdio-table-clip">
+        <table class="pure-table cdio-table group-overview-table">
+            <thead>
+            <tr>
+                <th></th>
+                <th class="watch-count">{{ _('# Watches') }}</th>
+                <th>{{ _('Tag / Label name') }}</th>
+                <th></th>
+            </tr>
+            </thead>
+            <tbody>
+            <!--
+            @Todo - connect Checked, Changed, Number of Watches etc
+            --->
+            {% if not available_tags|length %}
+            <tr>
+                <td colspan="3">{{ _('No website organisational tags/groups configured') }}</td>
+            </tr>
+            {% endif %}
+            <form method="POST" style="display: inline;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            {% for uuid, tag in available_tags  %}
+            <tr id="{{ uuid }}" class="">
+                <td class="watch-controls">
+                    <button formaction="{{url_for('tags.mute', uuid=tag.uuid)}}"  type="submit" class="bare-btn link-mute state-{{'on' if tag.notification_muted else 'off'}}" aria-label="{{ _('Mute notifications') }}" title="{{ _('Mute notifications') }}"><i data-feather="{{ 'bell-off' if tag.notification_muted else 'bell' }}" class="icon icon-mute"></i></button>
+                </td>
+                <td class="watch-count">{{ "{:,}".format(tag_count[uuid]) if uuid in tag_count else 0 }}</td>
+                <td class="title-col inline"> <a href="{{url_for('watchlist.index', tag=uuid) }}" class="watch-tag-list tag-{{ tag.title|sanitize_tag_class }}">{{ tag.title }}</a></td>
+                <td>
+                    <button formaction="{{ url_for('ui.form_watch_checknow', tag=uuid) }}" type="submit" class="cdio-btn"><i data-feather="refresh-cw"></i>{{ _('Recheck') }}</button>
+                    <a class="cdio-btn" href="{{ url_for('tags.form_tag_edit', uuid=uuid) }}">{{ _('Edit') }}</a>
+                    <a class="cdio-btn cdio-btn--danger"
+                       href="{{ url_for('tags.delete', uuid=uuid) }}"
+                       data-method="POST"
+                       data-requires-confirm
+                       data-confirm-type="danger"
+                       data-confirm-title="{{ _('Delete Group?') }}"
+                       data-confirm-message="{{ _('<p>Are you sure you want to delete group <strong>%(title)s</strong>?</p><p>This action cannot be undone.</p>', title=tag.title) }}"
+                       data-confirm-button="{{ _('Delete') }}"
+                       title="{{ _('Deletes and removes tag') }}">{{ _('Delete') }}</a>
+                    <a class="cdio-btn cdio-btn--warning"
+                       href="{{ url_for('tags.unlink', uuid=uuid) }}"
+                       data-method="POST"
+                       data-requires-confirm
+                       data-confirm-type="warning"
+                       data-confirm-title="{{ _('Unlink Group?') }}"
+                       data-confirm-message="{{ _('<p>Are you sure you want to unlink all watches from group <strong>%(title)s</strong>?</p><p>The tag will be kept but watches will be removed from it.</p>', title=tag.title) }}"
+                       data-confirm-button="{{ _('Unlink') }}"
+                       title="{{ _('Keep the tag but unlink any watches') }}">{{ _('Unlink') }}</a>
+                    <a href="{{ url_for('rss.rss_tag_feed', tag_uuid=uuid, token=app_rss_token)}}"><img alt="{{ _('RSS Feed for this watch') }}" style="padding-left: 1em;" src="{{url_for('static_content', group='images', filename='generic_feed-icon.svg')}}" height="15"></a>
+                </td>
+            </tr>
+            {% endfor %}
+            </form>
+            </tbody>
+        </table>
+        </div>
+    </div>
+</div>
+{% endblock %}
