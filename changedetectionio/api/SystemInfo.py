@@ -42,9 +42,11 @@ class SystemInfo(Resource):
         overdue_watches = overdue_watch_uuids(self.datastore)
         from changedetectionio import __version__ as main_version, worker_pool
         from changedetectionio.api.operations import checking_now
+        from changedetectionio.domain_rate_limiter import domain_rate_limiter
         from changedetectionio.processors import available_processors
         return {
             'checking_now': checking_now(self.datastore),
+            'domain_rate_limits': domain_rate_limiter.status_snapshot(self.datastore),
             'fetch_workers': worker_pool.get_worker_count(),
             'all_muted': self.datastore.data['settings']['application']['all_muted'],
             'all_paused': self.datastore.data['settings']['application']['all_paused'],

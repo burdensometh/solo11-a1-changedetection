@@ -55,6 +55,7 @@ def _per_page(datastore):
 def _snapshot(datastore, update_q, page=1, per_page=50):
     """Snapshot the queue + worker state into a JSON-friendly dict, paginating queued items."""
     from changedetectionio import worker_pool
+    from changedetectionio.domain_rate_limiter import domain_rate_limiter
 
     summary = update_q.get_queue_summary()
     running_uuids = worker_pool.get_running_uuids()
@@ -83,6 +84,7 @@ def _snapshot(datastore, update_q, page=1, per_page=50):
         'worker_count': worker_count,
         'running_count': len(running_items),
         'queued_count': total_queued,
+        'domain_rate_limits': domain_rate_limiter.status_snapshot(datastore),
         'summary': {
             'immediate': summary.get('immediate_items', 0),
             'clone': summary.get('clone_items', 0),

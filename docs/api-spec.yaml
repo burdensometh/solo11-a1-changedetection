@@ -960,6 +960,63 @@ components:
         fetch_workers:
           type: integer
           description: How many fetch workers check watches at the same time
+        domain_rate_limits:
+          type: object
+          description: |
+            Per-domain serial request queue state. When enabled, requests to the same domain are
+            spaced at least `min_interval_seconds` apart and repeated failures escalate the delay
+            through tiers (base, 2x, 4x, ...). Different domains continue to be fetched in parallel.
+          properties:
+            enabled:
+              type: boolean
+              description: Whether the per-domain minimum interval is configured (non-zero)
+            domain_count:
+              type: integer
+              description: Number of domains currently tracked by the limiter
+            domains:
+              type: array
+              items:
+                type: object
+                properties:
+                  domain:
+                    type: string
+                    description: Lowercased hostname the limits apply to
+                    example: example.com
+                  tier:
+                    type: integer
+                    description: Current slowdown tier, 0 is the base interval, each tier doubles the interval
+                    example: 0
+                  min_interval_seconds:
+                    type: number
+                    format: float
+                    description: Configured base spacing between two requests to this domain
+                  effective_interval_seconds:
+                    type: number
+                    format: float
+                    description: Spacing currently in effect after applying the tier multiplier
+                  consecutive_failures:
+                    type: integer
+                    description: Failed checks since the last successful check
+                  total_failures:
+                    type: integer
+                    description: Total failed checks seen for this domain
+                  total_successes:
+                    type: integer
+                    description: Total successful checks seen for this domain
+                  in_flight:
+                    type: boolean
+                    description: Whether a request to this domain is running right now
+                  in_flight_since:
+                    type: number
+                    format: float
+                    description: Epoch seconds when the current in-flight request started, null when idle
+                  last_request_at:
+                    type: number
+                    format: float
+                    description: Monotonic timestamp of the last started request (diagnostic only)
+                  last_error:
+                    type: string
+                    description: Error message from the most recent failed check, null after a success
         checking_now:
           type: array
           description: |
@@ -2539,6 +2596,30 @@ paths:
                 queue_size: 0
                 overdue_watches: ["cc0cfffa-f449-477b-83ea-0caafd1dc091", "14a10ae3-65b5-5cfc-ab6a-97c331f1c30f", "e980dbd0-f825-4002-b82f-3925b3221188"]
                 fetch_workers: 10
+                domain_rate_limits:
+                  enabled: true
+                  domain_count: 2
+                  domains:
+                    - domain: "throttled.example.org"
+                      tier: 2
+                      min_interval_seconds: 5
+                      effective_interval_seconds: 20
+                      consecutive_failures: 4
+                      total_failures: 4
+                      total_successes: 12
+                      in_flight: false
+                      in_flight_since: null
+                      last_error: "Error - Request returned a HTTP error code 429 (Access denied or blocked)"
+                    - domain: "example.com"
+                      tier: 0
+                      min_interval_seconds: 5
+                      effective_interval_seconds: 5
+                      consecutive_failures: 0
+                      total_failures: 0
+                      total_successes: 30
+                      in_flight: true
+                      in_flight_since: 1700000000.5
+                      last_error: null
                 checking_now:
                   - uuid: "095be615-a8ad-4c33-8e9c-c7612fbf6c9f"
                     title: "Example product page"

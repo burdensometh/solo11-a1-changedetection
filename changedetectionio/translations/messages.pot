@@ -1680,6 +1680,19 @@ msgid "Example - 3 seconds random jitter could trigger up to 3 seconds earlier o
 msgstr ""
 
 #: changedetectionio/blueprint/settings/templates/settings.html
+msgid ""
+"When several watches point at the same domain, their requests are queued one "
+"after another with at least this many seconds between them. Different "
+"domains are still fetched in parallel. Set to 0 to disable."
+msgstr ""
+
+#: changedetectionio/blueprint/settings/templates/settings.html
+msgid ""
+"Repeated failures automatically slow a domain down further (2x, 4x, ...); "
+"the current tier is visible in the queue/status view."
+msgstr ""
+
+#: changedetectionio/blueprint/settings/templates/settings.html
 msgid "For regular plain requests (not chrome based), maximum number of seconds until timeout, 1-999."
 msgstr ""
 
@@ -3047,6 +3060,44 @@ msgid "Workers & queue"
 msgstr ""
 
 #: changedetectionio/blueprint/ui/templates/queue.html
+msgid "Per-domain request limits"
+msgstr ""
+
+#: changedetectionio/blueprint/ui/templates/queue.html
+msgid ""
+"Requests to the same domain run one at a time. Repeated failures double the "
+"spacing (tier); a successful check steps it back down."
+msgstr ""
+
+#: changedetectionio/blueprint/ui/templates/queue.html
+msgid "Domain"
+msgstr ""
+
+#: changedetectionio/blueprint/ui/templates/queue.html
+msgid "Tier"
+msgstr ""
+
+#: changedetectionio/blueprint/ui/templates/queue.html
+msgid "Spacing (seconds)"
+msgstr ""
+
+#: changedetectionio/blueprint/ui/templates/queue.html
+msgid "Failures in a row"
+msgstr ""
+
+#: changedetectionio/blueprint/ui/templates/queue.html
+msgid "fetching"
+msgstr ""
+
+#: changedetectionio/blueprint/ui/templates/queue.html
+msgid "base"
+msgstr ""
+
+#: changedetectionio/blueprint/ui/templates/queue.html
+msgid "Last error"
+msgstr ""
+
+#: changedetectionio/blueprint/ui/templates/queue.html
 msgid "Elapsed"
 msgstr ""
 
@@ -4058,6 +4109,14 @@ msgstr ""
 
 #: changedetectionio/forms.py
 msgid "Random jitter seconds ± check"
+msgstr ""
+
+#: changedetectionio/forms.py
+msgid "Minimum seconds between requests to the same domain"
+msgstr ""
+
+#: changedetectionio/forms.py
+msgid "Should be between zero (disabled) and 86400 seconds"
 msgstr ""
 
 #: changedetectionio/forms.py

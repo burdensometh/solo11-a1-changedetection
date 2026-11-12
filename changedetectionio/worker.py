@@ -7,6 +7,7 @@ from changedetectionio import worker_pool
 from changedetectionio.queuedWatchMetaData import PrioritizedItem
 from changedetectionio.pluggy_interface import apply_update_handler_alter, apply_update_finalize
 from changedetectionio import gc_debounce
+from changedetectionio.domain_rate_limiter import domain_rate_limiter
 
 import asyncio
 import os
@@ -80,6 +81,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
         update_handler = None
         finalize_handler = None  # The handler update_finalize gets, see below
         watch = None
+        rate_state = None  # Per-domain limiter slot, set after acquire() below
         processing_exception = None  # Reset at start of each iteration to prevent state bleeding
 
         try:
@@ -170,6 +172,15 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
                 logger.info(f"Worker {worker_id} processing watch UUID {uuid} Priority {queued_item_data.priority} URL {watch['url']}")
 
+                # Per-domain serial slot: same-domain requests are spaced at least the configured
+                # interval apart (and further apart once failures trigger slowdown tiers), while
+                # different domains keep running in parallel across the other workers.
+                rate_state = await domain_rate_limiter.acquire(watch['url'], datastore)
+                # Set inside the fetch handlers below: any fetcher/processor exception counts as a
+                # failed request to this domain; a clean completion (even a non-200 HTTP status that
+                # the fetcher raised) is classified where it happens.
+                fetch_failed = False
+
                 try:
                     # Retrieve signal by name to ensure thread-safe access across worker threads
                     watch_check_update = signal('watch_check_update')
@@ -226,6 +237,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         e.xpath_data = None  # Free memory immediately
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': e.message})
                     process_changedetection_results = False
+                    fetch_failed = True
 
                 except PDFNotAvailableFromFetcher as e:
                     # Remember it's a PDF (normally only saved on success), so next time watch.is_pdf
@@ -233,6 +245,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     content_type = str(update_handler.fetcher.get_all_headers().get('content-type', '') or "").lower()
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': str(e), 'content-type': content_type})
                     process_changedetection_results = False
+                    fetch_failed = True
 
                 except content_fetchers_exceptions.ReplyWithContentButNoText as e:
                     extra_help = ""
@@ -284,6 +297,9 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
                                                                 'last_check_status': e.status_code})
                     process_changedetection_results = False
+                    # HTTP error statuses (including 429 rate-limiting) count as failed requests
+                    # against the domain so repeated blocks push it into a slower tier.
+                    fetch_failed = True
 
                 except FilterNotFoundInResponse as e:
                     if not datastore.data['watching'].get(uuid):
@@ -339,11 +355,13 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     datastore.update_watch(uuid=uuid,
                                          update_obj={'last_error': e.msg})
                     process_changedetection_results = False
-                    
+                    fetch_failed = True
+
                 except content_fetchers_exceptions.BrowserFetchTimedOut as e:
                     datastore.update_watch(uuid=uuid,
                                          update_obj={'last_error': e.msg})
                     process_changedetection_results = False
+                    fetch_failed = True
                     
                 except content_fetchers_exceptions.BrowserStepsStepException as e:
                     if not datastore.data['watching'].get(uuid):
@@ -389,12 +407,14 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
                                                                 'last_check_status': e.status_code})
                     process_changedetection_results = False
-                    
+                    fetch_failed = True
+
                 except content_fetchers_exceptions.ScreenshotUnavailable as e:
                     err_text = "Screenshot unavailable, page did not render fully in the expected time or page was too long - try increasing 'Wait seconds before extracting text'"
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
                                                                 'last_check_status': e.status_code})
                     process_changedetection_results = False
+                    fetch_failed = True
                     
                 except content_fetchers_exceptions.JSActionExceptions as e:
                     err_text = "Error running JS Actions - Page request - "+e.message
@@ -404,7 +424,8 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
                                                                 'last_check_status': e.status_code})
                     process_changedetection_results = False
-                    
+                    fetch_failed = True
+
                 except content_fetchers_exceptions.PageUnloadable as e:
                     err_text = "Page request from server didnt respond correctly"
                     if e.message:
@@ -418,6 +439,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                                                                 'last_check_status': e.status_code,
                                                                 'has_ldjson_price_data': None})
                     process_changedetection_results = False
+                    fetch_failed = True
                     
                 except content_fetchers_exceptions.BrowserStepsInUnsupportedFetcher as e:
                     err_text = "This watch has Browser Steps configured and so it cannot run with the 'Basic fast Plaintext/HTTP Client', either remove the Browser Steps or select a Chrome fetcher."
@@ -431,6 +453,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     logger.exception(f"Worker {worker_id} full exception details:")
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': "Exception: " + str(e)})
                     process_changedetection_results = False
+                    fetch_failed = True
 
                 else:
                     if not datastore.data['watching'].get(uuid):
@@ -632,6 +655,16 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         logger.exception(f"Worker {worker_id} full exception details:")
                         datastore.update_watch(uuid=uuid, update_obj={'last_error': str(e)})
 
+                # Report the outcome to the per-domain rate limiter. This also frees the serial
+                # slot so the next queued watch on the same domain can start its spacing window.
+                if rate_state is not None:
+                    if fetch_failed:
+                        domain_rate_limiter.record_failure(
+                            rate_state,
+                            error=watch.get('last_error') or 'fetch failed'
+                        )
+                    else:
+                        domain_rate_limiter.record_success(rate_state)
 
                 # Always record attempt count
                 count = watch.get('check_count', 0) + 1
@@ -693,8 +726,13 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
             # Also update the watch with error information
             if datastore and uuid in datastore.data['watching']:
                 datastore.update_watch(uuid=uuid, update_obj={'last_error': f"Worker error: {str(e)}"})
-        
+
         finally:
+            # Safety net: if the job bailed out before reporting to the rate limiter
+            # (unexpected exception between acquire() and record_*), free the serial
+            # slot and count the attempt as a failure so the domain can never wedge.
+            if rate_state is not None and rate_state.in_flight:
+                domain_rate_limiter.record_failure(rate_state, error='worker error before completion')
             # Always cleanup - this runs whether there was an exception or not
             if uuid:
                 # Capture references for plugin finalize hook BEFORE cleanup

@@ -144,6 +144,13 @@
                     <span class="pure-form-message-inline">{{ _('Example - 3 seconds random jitter could trigger up to 3 seconds earlier or up to 3 seconds later') }}</span>
                 </div>
                 <div class="pure-control-group">
+                    {{ render_field(form.requests.form.domain_rate_min_interval) }}
+                    <span class="pure-form-message-inline">
+                        {{ _('When several watches point at the same domain, their requests are queued one after another with at least this many seconds between them. Different domains are still fetched in parallel. Set to 0 to disable.') }}
+                        <br>{{ _('Repeated failures automatically slow a domain down further (2x, 4x, ...); the current tier is visible in the queue/status view.') }}
+                    </span>
+                </div>
+                <div class="pure-control-group">
                     {{ render_field(form.requests.form.timeout) }}
                     <span class="pure-form-message-inline">{{ _('For regular plain requests (not chrome based), maximum number of seconds until timeout, 1-999.') }}</span><br>
                 </div>

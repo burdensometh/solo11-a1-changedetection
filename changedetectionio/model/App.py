@@ -27,6 +27,9 @@ class model(dict):
                 'requests': {
                     'extra_proxies': [], # Configurable extra proxies via the UI
                     'extra_browsers': [],  # Configurable extra proxies via the UI
+                    # Minimum seconds between two requests to the SAME domain. 0 disables the
+                    # per-domain serial queue; different domains always stay parallel.
+                    'domain_rate_min_interval': int(getenv("DOMAIN_RATE_MIN_INTERVAL", "0")),
                     'jitter_seconds': 0,
                     'proxy': None, # Preferred proxy connection
                     'time_between_check': {'weeks': None, 'days': None, 'hours': 3, 'minutes': None, 'seconds': None},

@@ -1118,7 +1118,16 @@ class globalSettingsRequestForm(Form):
     jitter_seconds = IntegerField(_l('Random jitter seconds ± check'),
                                   render_kw={"style": "width: 5em;"},
                                   validators=[validators.NumberRange(min=0, message=_l("Should contain zero or more seconds"))])
-    
+
+    domain_rate_min_interval = IntegerField(
+        _l('Minimum seconds between requests to the same domain'),
+        render_kw={"style": "width: 5em;"},
+        validators=[validators.NumberRange(
+            min=0, max=86400,
+            message=_l("Should be between zero (disabled) and 86400 seconds")
+        )]
+    )
+
     workers = IntegerField(_l('Number of fetch workers'),
                           render_kw={"style": "width: 5em;"},
                           validators=[validators.NumberRange(min=1, max=50,

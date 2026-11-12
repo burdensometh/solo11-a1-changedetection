@@ -55,6 +55,45 @@ window.queueI18n = {
     </div>
   </div>
 
+  {% if snapshot.domain_rate_limits.enabled and snapshot.domain_rate_limits.domains %}
+  <div class="queue-panel">
+    <h3 style="margin: 0 0 0.6em 0;">{{ _('Per-domain request limits') }}</h3>
+    <div style="opacity:0.75; font-size:0.85rem; margin-bottom:0.5em;">
+      {{ _('Requests to the same domain run one at a time. Repeated failures double the spacing (tier); a successful check steps it back down.') }}
+    </div>
+    <table class="pure-table pure-table-striped">
+      <thead>
+        <tr>
+          <th>{{ _('Domain') }}</th>
+          <th style="width:90px;">{{ _('Tier') }}</th>
+          <th style="width:150px;">{{ _('Spacing (seconds)') }}</th>
+          <th style="width:120px;">{{ _('Failures in a row') }}</th>
+          <th style="width:110px;">{{ _('Status') }}</th>
+          <th>{{ _('Last error') }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for d in snapshot.domain_rate_limits.domains %}
+        <tr>
+          <td><strong>{{ d.domain }}</strong></td>
+          <td>{{ d.tier }}</td>
+          <td>{{ d.effective_interval_seconds }} <small style="opacity:0.6;">({{ _('base') }} {{ d.min_interval_seconds }})</small></td>
+          <td>{{ d.consecutive_failures }}</td>
+          <td>
+            {% if d.in_flight %}
+              <span class="inline-tag inline-tag--running">{{ _('fetching') }}</span>
+            {% else %}
+              <span class="inline-tag inline-tag--idle">{{ _('idle') }}</span>
+            {% endif %}
+          </td>
+          <td><small style="opacity:0.75;">{{ d.last_error or '' }}</small></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
   <div class="queue-panel">
     <h3 style="margin: 0 0 0.6em 0;">{{ _('Workers & queue') }}</h3>
     <table class="pure-table pure-table-striped">
