@@ -7,6 +7,7 @@ from changedetectionio import worker_pool
 from changedetectionio.queuedWatchMetaData import PrioritizedItem
 from changedetectionio.pluggy_interface import apply_update_handler_alter, apply_update_finalize
 from changedetectionio import gc_debounce
+from changedetectionio import retry
 
 import asyncio
 import os
@@ -161,6 +162,9 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                 contents = b''
                 process_changedetection_results = True
                 update_obj = {}
+                # The exception that failed this check, when one did. Passed to retry.plan_retry()
+                # afterwards to schedule a backoff retry or record a permanent failure.
+                failure_exception = None
 
                 # Clear last errors
                 datastore.data['watching'][uuid]['browser_steps_last_error_step'] = None
@@ -215,6 +219,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                 except PermissionError as e:
                     logger.critical(f"File permission error updating file, watch: {uuid}")
                     logger.critical(str(e))
+                    failure_exception = e
                     process_changedetection_results = False
 
                 except ProcessorException as e:
@@ -225,6 +230,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         watch.save_xpath_data(data=e.xpath_data)
                         e.xpath_data = None  # Free memory immediately
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': e.message})
+                    failure_exception = e
                     process_changedetection_results = False
 
                 except PDFNotAvailableFromFetcher as e:
@@ -232,6 +238,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     # makes resolve_content_fetcher() pick a fetcher that can supply the PDF
                     content_type = str(update_handler.fetcher.get_all_headers().get('content-type', '') or "").lower()
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': str(e), 'content-type': content_type})
+                    failure_exception = e
                     process_changedetection_results = False
 
                 except content_fetchers_exceptions.ReplyWithContentButNoText as e:
@@ -248,6 +255,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                         'last_error': f"Got HTML content but no text found (With {e.status_code} reply code){extra_help}",
                         'last_check_status': e.status_code
                     })
+                    failure_exception = e
 
                     if e.screenshot:
                         watch.save_screenshot(screenshot=e.screenshot, as_error=True)
@@ -283,6 +291,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
                                                                 'last_check_status': e.status_code})
+                    failure_exception = e
                     process_changedetection_results = False
 
                 except FilterNotFoundInResponse as e:
@@ -292,6 +301,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
 
                     err_text = "Warning, no filters were found, no change detection ran - Did the page change layout? update your Visual Filter if necessary."
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
+                    failure_exception = e
 
                     # Filter wasnt found, but we should still update the visual selector so that they can have a chance to set it up again
                     if e.screenshot:
@@ -332,7 +342,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     # Reset the edited flag since we successfully completed the check
                     watch.reset_watch_edited_flag()
                     # Page was fetched successfully - clear any previous error state
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': False})
+                    datastore.update_watch(uuid=uuid, update_obj={'last_error': False, 'retry': None})
                     cleanup_error_artifacts(uuid, datastore)
                     
                 except content_fetchers_exceptions.BrowserConnectError as e:
@@ -343,6 +353,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                 except content_fetchers_exceptions.BrowserFetchTimedOut as e:
                     datastore.update_watch(uuid=uuid,
                                          update_obj={'last_error': e.msg})
+                    failure_exception = e
                     process_changedetection_results = False
                     
                 except content_fetchers_exceptions.BrowserStepsStepException as e:
@@ -388,6 +399,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     err_text = "EmptyReply - try increasing 'Wait seconds before extracting text', Status Code {}".format(e.status_code)
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
                                                                 'last_check_status': e.status_code})
+                    failure_exception = e
                     process_changedetection_results = False
                     
                 except content_fetchers_exceptions.ScreenshotUnavailable as e:
@@ -417,11 +429,13 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text,
                                                                 'last_check_status': e.status_code,
                                                                 'has_ldjson_price_data': None})
+                    failure_exception = e
                     process_changedetection_results = False
-                    
+
                 except content_fetchers_exceptions.BrowserStepsInUnsupportedFetcher as e:
                     err_text = "This watch has Browser Steps configured and so it cannot run with the 'Basic fast Plaintext/HTTP Client', either remove the Browser Steps or select a Chrome fetcher."
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': err_text})
+                    failure_exception = e
                     process_changedetection_results = False
                     logger.error(f"Exception (BrowserStepsInUnsupportedFetcher) reached processing watch UUID: {uuid}")
 
@@ -430,6 +444,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     logger.error(f"Worker {worker_id} exception processing watch UUID: {uuid}")
                     logger.exception(f"Worker {worker_id} full exception details:")
                     datastore.update_watch(uuid=uuid, update_obj={'last_error': "Exception: " + str(e)})
+                    failure_exception = e
                     process_changedetection_results = False
 
                 else:
@@ -442,10 +457,21 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     update_obj['consecutive_filter_failures'] = 0
 
                     update_obj['last_error'] = False
+                    update_obj['retry'] = None
                     cleanup_error_artifacts(uuid, datastore)
 
                 if not datastore.data['watching'].get(uuid):
                     continue
+
+                # Classify the failure (if any) and store the retry/backoff state on the watch. The
+                # scheduler reads it and queues the retry when it comes due; a restart carries on.
+                if failure_exception is not None:
+                    try:
+                        retry_update = retry.plan_retry(datastore.data['watching'][uuid], failure_exception)
+                        if retry_update:
+                            datastore.update_watch(uuid=uuid, update_obj=retry_update)
+                    except Exception as e:
+                        logger.error(f"Worker {worker_id} could not record the retry state for {uuid}: {e}")
 
                 logger.debug(f"Processing watch UUID: {uuid} - xpath_data length returned {len(update_handler.xpath_data) if update_handler and update_handler.xpath_data else 'empty.'}")
                 if update_handler and process_changedetection_results:

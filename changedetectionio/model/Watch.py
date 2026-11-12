@@ -466,6 +466,7 @@ class model(EntityPersistenceMixin, watch_base):
             'last_viewed': 0,
             'previous_md5': False,
             'remote_server_reply': None,
+            'retry': None,
             'track_ldjson_price_data': None
         })
         watch_check_update = signal('watch_check_update')

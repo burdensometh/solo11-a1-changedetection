@@ -229,6 +229,11 @@ class watch_base(dict):
             'price_change_threshold_percent': None,
             'proxy': None,  # Preferred proxy connection
             'remote_server_reply': None,  # From 'server' reply header
+            # Failure-aware retry/backoff state (see changedetectionio/retry.py), persisted with the
+            # watch so a restart carries on with the same backoff sequence:
+            # {'attempts': int, 'check_started_at': epoch, 'failed_at': epoch,
+            #  'kind': 'timeout'|'server'|'permanent', 'next_retry_at': epoch|None, 'status_code': int|None}
+            'retry': None,
             'sort_text_alphabetically': False,
             'strip_ignored_lines': None,
             'subtractive_selectors': [],

@@ -40,6 +40,7 @@ def run_preloaded_first_check(datastore, uuid):
         timestamp = int(time.time())
         update_obj['content-type'] = str(handler.fetcher.get_all_headers().get('content-type', '') or "").lower()
         update_obj['last_error'] = False
+        update_obj['retry'] = None
         update_obj['last_checked'] = timestamp
         watch.reset_watch_edited_flag()
         datastore.update_watch(uuid=uuid, update_obj=update_obj)

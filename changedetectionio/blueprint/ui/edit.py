@@ -230,7 +230,9 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
 
             extra_update_obj = {
                 'consecutive_filter_failures': 0,
-                'last_error' : False
+                'last_error': False,
+                # Saving the watch is a fresh start: forget any backoff/pending retry from failures
+                'retry': None
             }
 
             if request.args.get('unpause_on_save'):

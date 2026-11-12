@@ -1738,6 +1738,7 @@ def notification_runner(worker_id=0):
 # Threaded runner, look for new watches to feed into the Queue.
 def ticker_thread_check_time_launch_checks():
     import random
+    from changedetectionio import retry
     from changedetectionio.pluggy_interface import apply_recheck_seconds_override
 
     proxy_last_called_time = {}
@@ -1885,7 +1886,13 @@ def ticker_thread_check_time_launch_checks():
 
             seconds_since_last_recheck = now - watch['last_checked']
 
-            if (
+            # A failed check that is worth retrying (timeout, HTTP 5xx) stores a backoff schedule in
+            # watch['retry'] (see changedetectionio/retry.py). When it comes due it is queued here,
+            # without waiting for the normal time-between-check interval - which for a failed check
+            # could otherwise be hours away.
+            retry_due = retry.is_retry_due(watch, now)
+
+            if retry_due or (
                 seconds_since_last_recheck >= (threshold + watch.jitter_seconds)
                 and seconds_since_last_recheck >= recheck_time_minimum_seconds
             ):
@@ -1929,6 +1936,7 @@ def ticker_thread_check_time_launch_checks():
                     if queued_successfully:
                         logger.debug(
                             f"> Queued watch UUID {uuid} "
+                            f"{'for retry' if retry_due else 'on its normal schedule'} "
                             f"Checked at {watch['last_checked']} "
                             f"queued at {now:0.2f} priority {priority} "
                             f"jitter {watch.jitter_seconds:0.2f}s, "

@@ -90,6 +90,9 @@ def _handle_operations(op, uuids, datastore, worker_pool, update_q, queuedWatchM
         for uuid in uuids:
             if datastore.data['watching'].get(uuid):
                 datastore.data['watching'][uuid]["last_error"] = False
+                # The user says it is fine now - drop the backoff/retry state too, so a pending
+                # retry is not queued and a permanent-failure record does not linger
+                datastore.data['watching'][uuid]["retry"] = None
                 datastore.data['watching'][uuid].commit()
         result_message = gettext("{} watches errors cleared").format(len(uuids))
 
