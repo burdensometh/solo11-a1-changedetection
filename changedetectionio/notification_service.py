@@ -12,6 +12,7 @@ from loguru import logger
 import time
 
 from changedetectionio.notification import default_notification_format, valid_notification_formats
+from changedetectionio.notification.records import claim_change_notification, release_change_notification
 
 
 def _check_cascading_vars(datastore, var_name, watch):
@@ -423,9 +424,33 @@ class NotificationService:
                                                     triggered_text=triggered_text,
                                                     timestamp_changed=dates[date_index_to]))
 
+        # Change fingerprint - the identity of "which change" this notification is
+        # about, from the content on either side of it. Dedupe and retries key on this.
+        # (RSS/test calls with a null:// sink never send, so they are not recorded.)
+        if watch and self.notification_q and not n_object.get('_change_fingerprint'):
+            from .notification.records import effective_change_fingerprint
+            prev_hash, current_hash, fingerprint = effective_change_fingerprint(
+                watch, prev_snapshot, current_snapshot
+            )
+            n_object['_change_fingerprint'] = fingerprint
+            n_object['_prev_hash'] = prev_hash
+            n_object['_current_hash'] = current_hash
+
+            # Claim it in the same step that decides to queue: if another check already
+            # queued/sent this exact change, this copy is a duplicate and is dropped.
+            if not claim_change_notification(watch, prev_hash, current_hash, fingerprint):
+                return None
+
         if self.notification_q:
             logger.debug("Queued notification for sending")
-            self.notification_q.put(n_object)
+            queued = self.notification_q.put(n_object)
+            # NotificationQueue.put() answers False for "muted system-wide" - the
+            # notification never left, so the claim must be released to not
+            # permanently suppress this change.
+            if queued is False and n_object.get('_change_fingerprint'):
+                from .notification.records import release_change_notification
+                release_change_notification(watch, n_object['_change_fingerprint'])
+            return queued
         else:
             logger.debug("Not queued, no queue defined. Just returning processed data")
             return n_object
@@ -465,12 +490,13 @@ class NotificationService:
         # (Individual watch) Only prepare to notify if the rules above matched
         queued = False
         if n_object and n_object.get('notification_urls'):
-            queued = True
-
-            count = watch.get('notification_alert_count', 0) + 1
-            self.datastore.update_watch(uuid=watch_uuid, update_obj={'notification_alert_count': count})
-
-            self.queue_notification_for_watch(n_object=n_object, watch=watch)
+            # queue_notification_for_watch() returns None for a duplicate (the same
+            # change was already queued/sent), False when the queue refused it (all muted)
+            result = self.queue_notification_for_watch(n_object=n_object, watch=watch)
+            queued = result is not None and result is not False
+            if queued:
+                count = watch.get('notification_alert_count', 0) + 1
+                self.datastore.update_watch(uuid=watch_uuid, update_obj={'notification_alert_count': count})
 
         return queued
 

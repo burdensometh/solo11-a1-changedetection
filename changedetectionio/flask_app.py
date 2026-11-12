@@ -1665,6 +1665,56 @@ def notification_runner(worker_id=0):
     global notification_debug_log
     import json
     from datetime import datetime
+    from changedetectionio.notification.records import (
+        notification_retry_queue, notification_should_send, handle_notification_sent,
+        build_retry_notification, mark_change_sending,
+    )
+
+    def _watch_for(n_object):
+        return datastore.data['watching'].get(n_object.get('uuid'))
+
+    def _send_one(n_object):
+        """Process one notification. Returns (sent_obj, error) - never raises."""
+        try:
+            from changedetectionio.notification.handler import process_notification
+
+            # Fallback to system config if not set
+            if not n_object.get('notification_body') and datastore.data['settings'][
+                'application'
+            ].get('notification_body'):
+                n_object['notification_body'] = datastore.data['settings'][
+                    'application'
+                ].get('notification_body')
+
+            if not n_object.get('notification_title') and datastore.data['settings'][
+                'application'
+            ].get('notification_title'):
+                n_object['notification_title'] = datastore.data['settings'][
+                    'application'
+                ].get('notification_title')
+
+            if not n_object.get('notification_format') and datastore.data['settings'][
+                'application'
+            ].get('notification_format'):
+                n_object['notification_format'] = datastore.data['settings'][
+                    'application'
+                ].get('notification_format')
+
+            if not n_object.get('notification_urls', {}):
+                return None, None
+
+            if n_object.get('_change_fingerprint'):
+                mark_change_sending(_watch_for(n_object), n_object.get('_change_fingerprint'))
+
+            sent_obj = process_notification(n_object, datastore)
+            handle_notification_sent(n_object, datastore, sent_obj)
+            # A retry that got through clears the error the failed attempt left on the watch
+            if n_object.get('_retry_attempts') and 'uuid' in n_object:
+                datastore.update_watch(uuid=n_object['uuid'],
+                                       update_obj={'last_notification_error': False})
+            return sent_obj, None
+        except Exception as e:
+            return None, e
 
     with app.app_context():
         while not app.config.exit.is_set():
@@ -1672,67 +1722,55 @@ def notification_runner(worker_id=0):
                 # Multiple workers can run concurrently (configurable via NOTIFICATION_WORKERS)
                 n_object = notification_q.get(block=False)
             except queue.Empty:
-                app.config.exit.wait(1)
+                # Nothing fresh to send - pick up a due retry instead.
+                n_object = notification_retry_queue.take_due()
+                if n_object is None:
+                    app.config.exit.wait(1)
+                    continue
 
-            else:
-                now = datetime.now()
-                sent_obj = None
+            now = datetime.now()
 
-                try:
-                    from changedetectionio.notification.handler import process_notification
+            # "发之前查一次" - the fingerprint was claimed when queued, but another
+            # worker may have delivered this same change since then.
+            if not notification_should_send(n_object, datastore):
+                continue
 
-                    # Fallback to system config if not set
-                    if not n_object.get('notification_body') and datastore.data['settings'][
-                        'application'
-                    ].get('notification_body'):
-                        n_object['notification_body'] = datastore.data['settings'][
-                            'application'
-                        ].get('notification_body')
+            sent_obj, error = _send_one(n_object)
 
-                    if not n_object.get('notification_title') and datastore.data['settings'][
-                        'application'
-                    ].get('notification_title'):
-                        n_object['notification_title'] = datastore.data['settings'][
-                            'application'
-                        ].get('notification_title')
+            if error is not None:
+                logger.error(
+                    f"Notification worker {worker_id} - Watch URL: {n_object['watch_url']}  Error {str(error)}"
+                )
 
-                    if not n_object.get('notification_format') and datastore.data['settings'][
-                        'application'
-                    ].get('notification_format'):
-                        n_object['notification_format'] = datastore.data['settings'][
-                            'application'
-                        ].get('notification_format')
-                    if n_object.get('notification_urls', {}):
-                        sent_obj = process_notification(n_object, datastore)
-
-                except Exception as e:
-                    logger.error(
-                        f"Notification worker {worker_id} - Watch URL: {n_object['watch_url']}  Error {str(e)}"
+                # UUID wont be present when we submit a 'test' from the global settings
+                if 'uuid' in n_object:
+                    datastore.update_watch(
+                        uuid=n_object['uuid'],
+                        update_obj={
+                            'last_notification_error': "Notification error detected, goto notification log."
+                        },
                     )
 
-                    # UUID wont be present when we submit a 'test' from the global settings
-                    if 'uuid' in n_object:
-                        datastore.update_watch(
-                            uuid=n_object['uuid'],
-                            update_obj={
-                                'last_notification_error': "Notification error detected, goto notification log."
-                            },
-                        )
+                log_lines = str(error).splitlines()
+                notification_debug_log += log_lines
 
-                    log_lines = str(e).splitlines()
-                    notification_debug_log += log_lines
+                with app.app_context():
+                    app.config['watch_check_update_SIGNAL'].send(
+                        app_context=app, watch_uuid=n_object.get('uuid')
+                    )
 
-                    with app.app_context():
-                        app.config['watch_check_update_SIGNAL'].send(
-                            app_context=app, watch_uuid=n_object.get('uuid')
-                        )
+                # Failed sends go to the retry queue (max three retries). The
+                # fingerprint is re-checked before every retry.
+                retry_object = build_retry_notification(n_object, datastore, error)
+                if retry_object is not None:
+                    notification_retry_queue.schedule(retry_object)
 
-                # Process notifications
-                notification_debug_log += [
-                    "{} - SENDING - {}".format(now.strftime("%c"), json.dumps(sent_obj))
-                ]
-                # Trim the log length
-                notification_debug_log = notification_debug_log[-100:]
+            # Process notifications
+            notification_debug_log += [
+                "{} - SENDING - {}".format(now.strftime("%c"), json.dumps(sent_obj))
+            ]
+            # Trim the log length
+            notification_debug_log = notification_debug_log[-100:]
 
 
 # Threaded runner, look for new watches to feed into the Queue.

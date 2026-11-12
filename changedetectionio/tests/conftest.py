@@ -291,6 +291,13 @@ def prepare_test_function(live_server, datastore_path):
         except:
             break
 
+    # Retried notifications from a previous test must not fire into this one
+    try:
+        from changedetectionio.notification.records import notification_retry_queue
+        notification_retry_queue.clear()
+    except Exception:
+        pass
+
     # Add test helper methods to the app for worker management
     def set_workers(count):
         """Set the number of workers for testing - brutal shutdown, no delays"""
@@ -365,7 +372,10 @@ def prepare_test_function(live_server, datastore_path):
     # Cleanup: Clear watches and queue after test
     try:
         from changedetectionio.flask_app import update_q
+        from changedetectionio.notification.records import notification_retry_queue
         from pathlib import Path
+
+        notification_retry_queue.clear()
 
         # Clear the queue to prevent leakage to next test
         while not update_q.empty():

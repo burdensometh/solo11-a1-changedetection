@@ -303,6 +303,19 @@ def apply_service_tweaks(url, n_body, n_title, requested_output_format):
     return url, n_body, n_title
 
 
+class NotificationSendError(Exception):
+    """Raised when at least one notification URL could not be delivered.
+
+    ``failed_urls`` lists the Apprise URLs that failed, so a retry only re-sends
+    those and never re-sends a URL that already received the notification
+    (a broken URL next to a working one must not duplicate the working one).
+    """
+
+    def __init__(self, message, failed_urls=None):
+        super().__init__(message)
+        self.failed_urls = list(failed_urls or [])
+
+
 def process_notification(n_object: NotificationContextData, datastore):
     import apprise
     from apprise import NotifyFormat
@@ -344,6 +357,8 @@ def process_notification(n_object: NotificationContextData, datastore):
     # raise it as an exception
 
     sent_objs = []
+    attempted_urls = []
+    failed_urls = []
 
     if 'as_async' in n_object:
         apprise_asset.async_mode = n_object.get('as_async')
@@ -476,11 +491,14 @@ def process_notification(n_object: NotificationContextData, datastore):
                     url_output_format = NotifyFormat.TEXT.value
 
 #@todo on null:// (only if its a 1 url with null) probably doesnt need to actually .add/setup/etc
-            sent_objs.append({'title': n_title,
-                              'body': n_body,
-                              'url': url,
-                              # So that we can do a null:// call and get back exactly what would have been sent
-                              'original_context': n_object })
+            sent_obj = {'title': n_title,
+                        'body': n_body,
+                        'url': url,
+                        # So that we can do a null:// call and get back exactly what would have been sent
+                        'original_context': n_object,
+                        'sent': False }
+            sent_objs.append(sent_obj)
+            attempted_urls.append(url)
 
             # Since the output is always based on the plaintext of the 'diff' engine, wrap it nicely.
             # It should always be similar to the 'history' part of the UI.
@@ -498,7 +516,7 @@ def process_notification(n_object: NotificationContextData, datastore):
                 # calling notify() on the empty instance would only add a misleading
                 # "There are no service(s) to notify" warning.
                 if url_apobj.add(url):
-                    url_apobj.notify(
+                    delivered = bool(url_apobj.notify(
                         title=n_title,
                         body=notify_body,
                         # `body_format` Tell apprise what format the INPUT is in, specify a wrong/bad type and it will force skip conversion in apprise
@@ -506,14 +524,29 @@ def process_notification(n_object: NotificationContextData, datastore):
                         body_format=apprise_input_format,
                         # False is not an option for AppRise, must be type None
                         attach=n_object.get('screenshot', None)
-                    )
+                    ))
+                else:
+                    delivered = False
+                sent_obj['sent'] = delivered
+                if not delivered:
+                    failed_urls.append(url)
+            else:
+                # null:// is a render-only sink, nothing is delivered by design
+                sent_obj['sent'] = True
 
         # Returns empty string if nothing found, multi-line string otherwise
         log_value = logs.getvalue()
 
+        if failed_urls:
+            logger.critical(log_value)
+            raise NotificationSendError(log_value or f"Delivery failed for {len(failed_urls)} URL(s)",
+                                        failed_urls=failed_urls)
+
         if log_value and ('WARNING' in log_value or 'ERROR' in log_value):
             logger.critical(log_value)
-            raise Exception(log_value)
+            # Apprise logged a warning/error but could not tell us which URL it
+            # belongs to - treat the whole set as failed (retry all of them).
+            raise NotificationSendError(log_value, failed_urls=attempted_urls)
 
     # Return what was sent for better logging - after the for loop
     return sent_objs

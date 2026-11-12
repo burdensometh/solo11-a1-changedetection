@@ -150,6 +150,31 @@ def wait_for_notification_endpoint_output(datastore_path):
 
     return False
 
+
+def count_notification_hits(datastore_path):
+    """How many notification deliveries have reached test_notification_endpoint.
+
+    Resets the per-URL failure counter (see ?fail_first=) too, so the next test
+    starts from a clean slate.
+    """
+    from os.path import isfile
+    hits_file = os.path.join(datastore_path, "notification-hits.txt")
+    if not isfile(hits_file):
+        return 0
+    with open(hits_file, "r", encoding="utf-8") as f:
+        return len([line for line in f if line.strip()])
+
+
+def wait_for_notification_hits(datastore_path, expected, timeout=20):
+    """Block until at least `expected` deliveries arrived. Returns the count."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        count = count_notification_hits(datastore_path)
+        if count >= expected:
+            return count
+        time.sleep(0.2)
+    return count_notification_hits(datastore_path)
+
 # kinda funky, but works for now
 def get_UUID_for_tag_name(client, name):
     app_config = client.application.config.get('DATASTORE').data
@@ -444,11 +469,16 @@ def new_live_server_setup(live_server):
     def test_notification_endpoint():
         datastore_path = current_app.config.get('TEST_DATASTORE_PATH', 'test-datastore')
 
+        data = request.stream.read()
         with open(os.path.join(datastore_path, "notification.txt"), "wb") as f:
             # Debug method, dump all POST to file also, used to prove #65
-            data = request.stream.read()
             if data != None:
                 f.write(data)
+
+        # Every delivery is also appended here, with the status this URL answered,
+        # so a test can count how many separate sends actually arrived (dedupe/retry).
+        with open(os.path.join(datastore_path, "notification-hits.txt"), "a", encoding="utf-8") as f:
+            f.write("{}\n".format(request.args.get('status_code', 200)))
 
         with open(os.path.join(datastore_path, "notification-url.txt"), "w") as f:
             f.write(request.url)
@@ -462,8 +492,25 @@ def new_live_server_setup(live_server):
 
         print("\n>> Test notification endpoint was hit.\n", data)
 
+        # ?fail_first=N answers 500 to the first N hits for this URL, then 200s -
+        # lets a test drive the send-failure retry path for real.
+        fail_first = int(request.args.get('fail_first', 0))
+        with open(os.path.join(datastore_path, "notification-fail-count.txt"), "a+", encoding="utf-8") as f:
+            f.seek(0)
+            try:
+                failures_served = int(f.read().strip() or 0)
+            except ValueError:
+                failures_served = 0
+            if failures_served < fail_first:
+                failures_served += 1
+                f.seek(0)
+                f.truncate()
+                f.write(str(failures_served))
+                status_code = 500
+            else:
+                status_code = request.args.get('status_code', 200)
+
         content = "Text was set"
-        status_code = request.args.get('status_code',200)
         resp = make_response(content, status_code)
         return resp
 
