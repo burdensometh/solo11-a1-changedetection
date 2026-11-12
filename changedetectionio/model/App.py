@@ -1,6 +1,7 @@
 from os import getenv
 from copy import deepcopy
 
+from changedetectionio.strtobool import strtobool
 from changedetectionio.blueprint.menu_modes import MENU_SIDEBAR_ACTIONMODES_DEFAULT
 from changedetectionio.blueprint.rss import RSS_FORMAT_TYPES, RSS_CONTENT_FORMAT_DEFAULT
 from changedetectionio.model.Tags import TagsDict
@@ -15,6 +16,16 @@ from changedetectionio.notification import (
 _FILTER_FAILURE_THRESHOLD_ATTEMPTS_DEFAULT = 6
 DEFAULT_SETTINGS_HEADERS_USERAGENT='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.66 Safari/537.36'
 
+
+def _env_retention_default(name, default, kind):
+    """A tolerant env default, so one bad value can't stop the app from importing."""
+    value = getenv(name)
+    if value is None or not str(value).strip():
+        return default
+    try:
+        return kind(str(value).strip())
+    except ValueError:
+        return default
 
 
 class model(dict):
@@ -49,6 +60,14 @@ class model(dict):
                     'global_ignore_text': [], # List of text to ignore when calculating the comparison checksum
                     'global_subtractive_selectors': [],
                     'history_snapshot_max_length': None,
+                    # Snapshot retention: keep the newest N snapshots and nothing older than N days,
+                    # always keeping the current version, the version before the latest change, and
+                    # any pinned snapshot. See changedetectionio/snapshot_retention.py. The env vars
+                    # are applied in __init__ below (and only to a fresh install's defaults; the
+                    # UI/settings file wins after that).
+                    'snapshot_retention_enabled': True,
+                    'snapshot_retention_keep_last': 30,
+                    'snapshot_retention_keep_days': 30,
                     'ignore_whitespace': True,
                     'ignore_status_codes': False, #@todo implement, as ternary.
                     'ssim_threshold': '0.96',  # Default SSIM threshold for screenshot comparison
@@ -94,6 +113,14 @@ class model(dict):
         existing_tags = self.get('settings', {}).get('application', {}).get('tags') or {}
         # CRITICAL: deepcopy to avoid sharing mutable objects between instances
         self.update(deepcopy(self.base_config))
+        # Env overrides are read here, not in base_config: the class attribute is evaluated once
+        # at import, so a value set later (tests, a restarted process with a different env) would
+        # never take effect.
+        self['settings']['application'].update({
+            'snapshot_retention_enabled': _env_retention_default('SNAPSHOT_RETENTION_ENABLED', True, strtobool),
+            'snapshot_retention_keep_last': _env_retention_default('SNAPSHOT_RETENTION_KEEP_LAST', 30, int),
+            'snapshot_retention_keep_days': _env_retention_default('SNAPSHOT_RETENTION_KEEP_DAYS', 30, int),
+        })
         # TagsDict requires the real datastore_path at runtime (cannot be set at class-definition time)
         if datastore_path is None:
             raise ValueError("App.model() requires 'datastore_path' keyword argument")

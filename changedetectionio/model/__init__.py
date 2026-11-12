@@ -133,6 +133,7 @@ class watch_base(dict):
         consecutive_filter_failures (int): Counter for consecutive filter match failures
         previous_md5 (str|bool): MD5 hash of previous content
         history_snapshot_max_length (int|None): Max history snapshots to keep (None = use global)
+        pinned_snapshots (List[str]): History timestamps the user pinned; never deleted by retention
 
     Conditions:
         conditions (dict): Custom conditions for change detection logic
@@ -224,6 +225,8 @@ class watch_base(dict):
             'notification_urls': [],  # List of URLs to add to the notification Queue (Usually AppRise)
             'page_title': None, # <title> from the page
             'paused': False,
+            # History timestamps the user pinned; retention never deletes these.
+            'pinned_snapshots': [],
             'previous_md5': False,
             'processor': 'text_json_diff',  # could be restock_diff or others from .processors
             'price_change_threshold_percent': None,
@@ -353,8 +356,11 @@ class watch_base(dict):
         # `last_viewed` is set internally by mark_all_viewed and shouldn't flag the watch as
         # edited, but is not in SYSTEM_MANAGED_NON_SPEC_FIELDS because it IS user-writable via
         # the UpdateWatch schema (the API path).
+        # `pinned_snapshots` is the same: user-writable through the API and the history page,
+        # but pinning only changes which snapshots retention may delete. It never changes what
+        # the fetched content is compared against, so it must not force a full reprocess.
         if (key not in get_readonly_watch_fields()
-                and key != 'last_viewed'
+                and key not in ('last_viewed', 'pinned_snapshots')
                 and key not in SYSTEM_MANAGED_NON_SPEC_FIELDS):
             self.__watch_was_edited = True
 

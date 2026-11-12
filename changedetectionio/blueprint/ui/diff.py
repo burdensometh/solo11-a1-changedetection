@@ -46,6 +46,24 @@ def _clean_litellm_error(exc) -> str:
     return first_line or raw.split('\n')[0]
 
 
+def change_pin(watch, timestamp, action):
+    """Apply a pin/unpin to a watch. Returns None, or (error message, HTTP status)."""
+    if timestamp not in watch.history:
+        return 'Snapshot not found', 404
+    if action not in ('pin', 'unpin'):
+        return 'action must be pin or unpin', 400
+
+    from changedetectionio import snapshot_retention
+    with snapshot_retention.watch_lock(watch.data_dir):
+        changed = watch.pin_snapshot(timestamp) if action == 'pin' else watch.unpin_snapshot(timestamp)
+    # Commit outside the per-watch lock: it takes the datastore lock, and that must be the
+    # outer lock (delete() holds it while removing the watch directory).
+    if changed:
+        watch.commit()
+    logger.info(f"[{watch.get('uuid')}] Snapshot {timestamp} action={action} by user (changed={changed})")
+    return None
+
+
 def construct_blueprint(datastore: ChangeDetectionStore):
     diff_blueprint = Blueprint('ui_diff', __name__, template_folder="../ui/templates")
 
@@ -534,6 +552,35 @@ def construct_blueprint(datastore: ChangeDetectionStore):
         # Genuinely nothing: the process restarted mid-generation. Tell the client to start again
         # rather than poll forever.
         return jsonify({'summary': None, 'error': None, 'status': 'idle'})
+
+    @diff_blueprint.route("/diff/<uuid_str:uuid>/pin", methods=['POST'])
+    @login_optionally_required
+    def pin_snapshot(uuid):
+        """Pin or unpin one history snapshot so retention never deletes it.
+
+        POST with ``timestamp`` and ``action`` ('pin' or 'unpin'). Returns JSON so the
+        history page can update in place; a form post without JS still redirects back.
+        """
+        from flask import jsonify
+
+        if uuid == 'first':
+            uuid = list(datastore.data['watching'].keys()).pop()
+        watch = datastore.data['watching'].get(uuid)
+        if not watch:
+            return jsonify({'error': 'Watch not found'}), 404
+
+        timestamp = (request.form.get('timestamp') or request.args.get('timestamp') or '').strip()
+        action = (request.form.get('action') or request.args.get('action') or 'pin').strip().lower()
+        error = change_pin(watch, timestamp, action)
+        if error:
+            return jsonify({'error': error[0]}), error[1]
+
+        wants_json = request.headers.get('Accept', '').startswith('application/json') or request.is_json
+        if wants_json:
+            return jsonify({'timestamp': timestamp,
+                            'pinned': bool(watch.is_snapshot_pinned(timestamp)),
+                            'pinned_snapshots': list(watch.get('pinned_snapshots') or [])})
+        return redirect(url_for('ui.ui_diff.diff_history_page', uuid=uuid))
 
     @diff_blueprint.route("/diff/<uuid_str:uuid>/processor-data", methods=['GET'])
     @login_optionally_required

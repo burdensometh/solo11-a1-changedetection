@@ -70,6 +70,19 @@ services:
   #        is refused until one is deleted. Unset means unlimited.
   #      - PAGE_WATCH_LIMIT=100
   #
+  #        Snapshot retention (also adjustable in Settings > History): keep the newest N
+  #        snapshots and nothing older than N days. The current version, the version before the
+  #        latest change and any version pinned from the history page are always kept.
+  #        These env vars only seed a fresh install; after that the settings file/UI wins.
+  #        0 switches one limit off, both 0 keeps everything, SNAPSHOT_RETENTION_ENABLED=false
+  #        stops new cleanups (already-marked deletions are still finished).
+  #      - SNAPSHOT_RETENTION_ENABLED=true
+  #      - SNAPSHOT_RETENTION_KEEP_LAST=30
+  #      - SNAPSHOT_RETENTION_KEEP_DAYS=30
+  #        Seconds between background cleanup passes (and the startup delay).
+  #      - SNAPSHOT_RETENTION_INTERVAL_SECONDS=3600
+  #      - SNAPSHOT_RETENTION_INITIAL_DELAY_SECONDS=120
+  #
   #        If you want to watch local files file:///path/to/file.txt (careful! security implications!)
   #      - ALLOW_FILE_URI=False
   #

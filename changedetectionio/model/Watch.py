@@ -432,6 +432,7 @@ class model(EntityPersistenceMixin, watch_base):
         import pathlib
 
         # Get list of processor config files to preserve
+        from changedetectionio import snapshot_retention
         from changedetectionio.processors import find_processors
         processor_names = [name for cls, name in find_processors()]
         processor_config_files = {f"{name}.json" for name in processor_names}
@@ -439,35 +440,40 @@ class model(EntityPersistenceMixin, watch_base):
         from changedetectionio.pluggy_interface import collect_watch_settings_files
         processor_config_files |= collect_watch_settings_files(self)
 
-        # JSON Data, Screenshots, Textfiles (history index and snapshots), HTML in the future etc
-        # But preserve processor config files (they're configuration, not history data)
-        # Use glob not rglob here for safety.
-        for item in pathlib.Path(str(self.data_dir)).glob("*.*"):
-            # Skip processor config files
-            if item.name in processor_config_files:
-                continue
-            # A save or check running now may rename its .tmp file away between glob() and here
-            item.unlink(missing_ok=True)
+        # Hold the snapshot lock so a background cleanup can't be halfway through rewriting
+        # the index while the directory is being emptied, and so we don't leave a marker that
+        # refers to snapshots that no longer exist.
+        with snapshot_retention.watch_lock(self.data_dir):
+            # JSON Data, Screenshots, Textfiles (history index and snapshots), HTML in the future etc
+            # But preserve processor config files (they're configuration, not history data)
+            # Use glob not rglob here for safety.
+            for item in pathlib.Path(str(self.data_dir)).glob("*.*"):
+                # Skip processor config files
+                if item.name in processor_config_files:
+                    continue
+                # A save or check running now may rename its .tmp file away between glob() and here
+                item.unlink(missing_ok=True)
 
-        _forget_favicon_filename(self.data_dir)
+            _forget_favicon_filename(self.data_dir)
 
-        # Force the attr to recalculate
-        bump = self.history
+            # Force the attr to recalculate
+            bump = self.history
 
-        # Do this last because it will trigger a recheck due to last_checked being zero
-        self.update({
-            'browser_steps_last_error_step': None,
-            'check_count': 0,
-            'fetch_time': 0.0,
-            'has_ldjson_price_data': None,
-            'last_checked': 0,
-            'last_error': False,
-            'last_notification_error': False,
-            'last_viewed': 0,
-            'previous_md5': False,
-            'remote_server_reply': None,
-            'track_ldjson_price_data': None
-        })
+            # Do this last because it will trigger a recheck due to last_checked being zero
+            self.update({
+                'browser_steps_last_error_step': None,
+                'check_count': 0,
+                'fetch_time': 0.0,
+                'has_ldjson_price_data': None,
+                'last_checked': 0,
+                'last_error': False,
+                'last_notification_error': False,
+                'last_viewed': 0,
+                'pinned_snapshots': [],
+                'previous_md5': False,
+                'remote_server_reply': None,
+                'track_ldjson_price_data': None
+            })
         watch_check_update = signal('watch_check_update')
         if watch_check_update:
             watch_check_update.send(watch_uuid=self.get('uuid'))
@@ -760,32 +766,43 @@ class model(EntityPersistenceMixin, watch_base):
     def history_trim(self, newest_n_items):
         from pathlib import Path
         import gc
-        # Sort by timestamp (key)
-        sorted_items = sorted(self.history.items(), key=lambda x: int(x[0]))
+        from changedetectionio import snapshot_retention
 
-        keep_part = dict(sorted_items[-newest_n_items:])
-        delete_part = dict(sorted_items[:-newest_n_items])
-        logger.info( f"[{self.get('uuid')}] Trimming history to most recent {newest_n_items} items, keeping {len(keep_part)} items deleting {len(delete_part)} items.")
+        # Hold the snapshot lock: the background cleanup rewrites this same index under it.
+        with snapshot_retention.watch_lock(self.data_dir):
+            # Sort by timestamp (key)
+            sorted_items = sorted(self.history.items(), key=lambda x: int(x[0]))
 
-        if delete_part:
-            for item in delete_part.items():
-                try:
-                    Path(item[1]).unlink(missing_ok=True)
-                except Exception as e:
-                    logger.critical(f"{str(e)}")
-                finally:
-                    logger.debug(f"[{self.get('uuid')}] Deleted {item[1]} history snapshot")
-        try:
-            dest = os.path.join(self.data_dir, self.history_index_filename)
-            output = "\r\n".join(
-                f"{k},{Path(v).name}"
-                for k, v in keep_part.items()
-            )+"\r\n"
-            self._write_atomic(dest=dest, data=output, mode='w')
-        except Exception as e:
-            logger.critical(f"{str(e)}")
-        finally:
-            logger.debug(f"[{self.get('uuid')}] Updated history index {dest}")
+            # Pinned snapshots are never trimmed, so the user's "keep this one" survives the cap.
+            pins = {str(t) for t in snapshot_retention.pinned_timestamps(self)}
+            protected = [item for item in sorted_items if item[0] in pins]
+            trimmable = [item for item in sorted_items if item[0] not in pins]
+            # The index must stay oldest -> newest: Watch.history() treats its last key as the
+            # current version, so a pinned-but-old snapshot must not end up at the end.
+            keep_part = dict(sorted(trimmable[-newest_n_items:] + protected,
+                                    key=lambda item: int(item[0])))
+            delete_part = dict(trimmable[:-newest_n_items])
+            logger.info(f"[{self.get('uuid')}] Trimming history to most recent {newest_n_items} items, keeping {len(keep_part)} items deleting {len(delete_part)} items.")
+
+            if delete_part:
+                for item in delete_part.items():
+                    try:
+                        Path(item[1]).unlink(missing_ok=True)
+                    except Exception as e:
+                        logger.critical(f"{str(e)}")
+                    finally:
+                        logger.debug(f"[{self.get('uuid')}] Deleted {item[1]} history snapshot")
+            try:
+                dest = os.path.join(self.data_dir, self.history_index_filename)
+                output = "\r\n".join(
+                    f"{k},{Path(v).name}"
+                    for k, v in keep_part.items()
+                )+"\r\n"
+                self._write_atomic(dest=dest, data=output, mode='w')
+            except Exception as e:
+                logger.critical(f"{str(e)}")
+            finally:
+                logger.debug(f"[{self.get('uuid')}] Updated history index {dest}")
 
         # reimport
         bump = self.history
@@ -800,6 +817,15 @@ class model(EntityPersistenceMixin, watch_base):
         self.ensure_data_dir_exists()
         skip_brotli = strtobool(os.getenv('DISABLE_BROTLI_TEXT_SNAPSHOT', 'False'))
 
+        # Everything from writing the snapshot file to updating the index happens under the
+        # per-watch lock. Snapshot files are named by content hash, so a save of content that
+        # is also held by an expired entry could otherwise recreate a file that the background
+        # cleanup is deleting at the same moment, leaving a dangling index entry.
+        from changedetectionio import snapshot_retention
+        with snapshot_retention.watch_lock(self.data_dir):
+            return self._save_history_blob_locked(contents, timestamp, snapshot_id, skip_brotli)
+
+    def _save_history_blob_locked(self, contents, timestamp, snapshot_id, skip_brotli):
         # Binary data - detect file type and save without compression
         if isinstance(contents, bytes):
             try:
@@ -844,7 +870,7 @@ class model(EntityPersistenceMixin, watch_base):
                 dest = os.path.join(self.data_dir, snapshot_fname)
                 self._write_atomic(dest, contents.encode('utf-8'))
 
-        # Append to history.txt atomically
+        # Append to history.txt atomically (the caller holds the per-watch lock).
         index_fname = os.path.join(self.data_dir, self.history_index_filename)
         index_line = f"{timestamp},{snapshot_fname}\n"
 
@@ -927,6 +953,30 @@ class model(EntityPersistenceMixin, watch_base):
         # Check that everything in local_lines(new stuff) already exists in existing_history - it should
         # if not, something new happened
         return not local_lines.issubset(existing_history)
+
+    # History timestamps the user pinned; retention never deletes these.
+    def is_snapshot_pinned(self, timestamp):
+        return str(timestamp) in {str(t) for t in (self.get('pinned_snapshots') or [])}
+
+    def pin_snapshot(self, timestamp):
+        """Pin a history timestamp so snapshot retention never deletes it. Returns True if added."""
+        ts = str(int(timestamp))
+        if ts not in (self.history or {}):
+            return False
+        pins = [str(t) for t in (self.get('pinned_snapshots') or [])]
+        if ts in pins:
+            return False
+        self['pinned_snapshots'] = sorted(set(pins) | {ts}, key=lambda x: int(x))
+        return True
+
+    def unpin_snapshot(self, timestamp):
+        """Unpin a history timestamp. Returns True if it was pinned."""
+        ts = str(int(timestamp))
+        pins = [str(t) for t in (self.get('pinned_snapshots') or [])]
+        if ts not in pins:
+            return False
+        self['pinned_snapshots'] = sorted((p for p in pins if p != ts), key=lambda x: int(x))
+        return True
 
     def get_screenshot(self):
         fname = os.path.join(self.data_dir, "last-screenshot.png")
@@ -1624,10 +1674,13 @@ class model(EntityPersistenceMixin, watch_base):
         return False
 
     def _prune_last_fetched_pdf_snapshots(self):
-        # Keep only the PDFs of the newest two history entries. Matched by filename rather than by
-        # walking the history, so PDFs of entries that history_trim() already removed go too.
+        # Keep only the PDFs of the newest two history entries plus any pinned/current snapshot,
+        # so snapshot retention's protected files aren't dropped here. Matched by filename rather
+        # than by walking the history, so PDFs of entries that history_trim() already removed go too.
         # (Binary history snapshots are named by md5, so a digits-only name is always ours)
+        from changedetectionio import snapshot_retention
         keep = set(str(k) for k in list(self.history.keys())[-2:])
+        keep |= {str(t) for t in snapshot_retention.protected_timestamps(self)}
         for f in Path(self.data_dir).glob('*.pdf'):
             if f.stem.isdigit() and f.stem not in keep:
                 f.unlink(missing_ok=True)
@@ -1637,12 +1690,17 @@ class model(EntityPersistenceMixin, watch_base):
         dates = list(self.history.keys())
         dates.reverse()
 
+        # Snapshot retention protects pinned snapshots (and the current / pre-change versions);
+        # don't drop their HTML copies here just because they're older than the newest two.
+        from changedetectionio import snapshot_retention
+        protected = {str(t) for t in snapshot_retention.protected_timestamps(self)}
+
         for index, timestamp in enumerate(dates):
             snapshot_fname = f"{timestamp}.html.br"
             filepath = os.path.join(self.data_dir, snapshot_fname)
 
-            # Keep only the first 2
-            if index > 1 and os.path.isfile(filepath):
+            # Keep only the first 2 (plus any protected snapshot)
+            if index > 1 and str(timestamp) not in protected and os.path.isfile(filepath):
                 os.remove(filepath)
 
 

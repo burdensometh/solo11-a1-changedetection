@@ -1611,6 +1611,7 @@ def changedetection_app(config=None, datastore_o=None):
         logger.info(f"Started {notification_workers} notification worker(s)")
 
         in_pytest = "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
+        start_snapshot_retention_thread(app, datastore, in_pytest)
         # Check for new release version, but not when running in test/build or pytest
         if (
             not os.getenv("GITHUB_REF", False)
@@ -1626,6 +1627,24 @@ def changedetection_app(config=None, datastore_o=None):
     # Return the Flask app - the Socket.IO will be attached to it but initialized separately
     # This avoids circular dependencies
     return app
+
+
+def start_snapshot_retention_thread(app, datastore, in_pytest):
+    """Start the supervised snapshot-retention thread, unless disabled or running tests.
+
+    A pass re-reads each watch's cleanup marker, so a crash mid-reclaim resumes instead of
+    losing the marked work; supervise() restarts the loop if it ever dies.
+    """
+    if in_pytest or strtobool(os.getenv('SNAPSHOT_RETENTION_DISABLE_BACKGROUND', 'false')):
+        logger.debug("Snapshot retention background thread not started")
+        return None
+    from . import snapshot_retention
+    return start_supervised_thread(
+        target=lambda: snapshot_retention.retention_loop(datastore, app.config.exit),
+        name="SnapshotRetention",
+        exit_event=app.config.exit,
+        is_shutting_down=lambda: bool(getattr(datastore, 'stop_thread', False)),
+    )
 
 
 # Check for new version and anonymous stats

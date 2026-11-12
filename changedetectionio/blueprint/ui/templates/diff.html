@@ -32,7 +32,7 @@
                 <select id="diff-from-version" name="from_version" class="needs-localtime">
                     {%- for version in versions|reverse -%}
                         <option value="{{ version }}" {% if version== from_version %} selected="" {% endif %}>
-                            {{ version }}{#{% if loop.index == 2 %} (Previous){% endif %}#}
+                            {% if watch_a.is_snapshot_pinned(version) %}&#9733; {% endif %}{{ version }}{#{% if loop.index == 2 %} (Previous){% endif %}#}
                         </option>
                     {%- endfor -%}
                 </select>
@@ -43,7 +43,7 @@
                 <select id="diff-to-version" name="to_version" class="needs-localtime">
                     {%- for version in versions|reverse -%}
                         <option value="{{ version }}" {% if version== to_version %} selected="" {% endif %}>
-                            {{ version }}{#{% if loop.first %} (Current){% endif %}#}
+                            {% if watch_a.is_snapshot_pinned(version) %}&#9733; {% endif %}{{ version }}{#{% if loop.first %} (Current){% endif %}#}
                         </option>
                     {%- endfor -%}
                 </select>
@@ -106,6 +106,20 @@
             </div>
         {%- endif -%}
     </form>
+    {%- if versions|length >= 1 -%}
+    {# Snapshot cleanup keeps the newest versions and drops the rest; a pinned version is
+       exempt, and the star in the selectors above marks it. A separate form because forms
+       cannot nest and the diff-form above is a GET. #}
+    <form class="pure-form" action="{{ url_for('ui.ui_diff.pin_snapshot', uuid=uuid) }}" method="POST" id="pin-snapshot-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="timestamp" id="pin-snapshot-timestamp" value="{{ to_version }}">
+        {%- set pinned = watch_a.is_snapshot_pinned(to_version) -%}
+        <input type="hidden" name="action" id="pin-snapshot-action" value="{{ 'unpin' if pinned else 'pin' }}">
+        <button type="submit" class="pure-button" id="pin-snapshot-button" title="{{ _('Pinned versions are never removed by snapshot cleanup') }}">
+            {% if pinned %}&#9733; {{ _('Unpin this version') }}{% else %}&#9734; {{ _('Keep this version') }}{% endif %}
+        </button>
+    </form>
+    {%- endif -%}
 </div>
 
 <div id="diff-jump" style="display:none;"><!-- disabled for now -->
@@ -201,6 +215,33 @@
     const newest_version_timestamp = {{newest_version_timestamp}};
 </script>
 <script src="{{url_for('static_content', group='js', filename='diff-render.js')}}"></script>
+{%- if versions|length >= 1 -%}
+<script>
+    // Keep "Keep/Unpin this version" pointing at whatever the "To" dropdown selects, so
+    // pinning acts on the version being looked at. The selectors are plain form controls;
+    // this only makes the action follow them.
+    (function () {
+        const pinned = {{ (watch_a.get('pinned_snapshots') or [])|tojson }};
+        const toSelect = document.getElementById('diff-to-version');
+        const form = document.getElementById('pin-snapshot-form');
+        if (!toSelect || !form) return;
+        const tsField = document.getElementById('pin-snapshot-timestamp');
+        const actionField = document.getElementById('pin-snapshot-action');
+        const button = document.getElementById('pin-snapshot-button');
+        const keepLabel = {{ _('Keep this version')|tojson }};
+        const unpinLabel = {{ _('Unpin this version')|tojson }};
+        function sync() {
+            const version = String(toSelect.value);
+            tsField.value = version;
+            const isPinned = pinned.indexOf(version) !== -1;
+            actionField.value = isPinned ? 'unpin' : 'pin';
+            button.innerHTML = isPinned ? '&#9733; ' + unpinLabel : '&#9734; ' + keepLabel;
+        }
+        toSelect.addEventListener('change', sync);
+        sync();
+    })();
+</script>
+{%- endif -%}
 
 {% if llm_configured %}
 <script>

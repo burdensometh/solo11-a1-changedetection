@@ -598,6 +598,17 @@ components:
           minimum: 1
           maximum: 1000
           description: Maximum number of history snapshots to keep (null = use system default)
+        pinned_snapshots:
+          type: array
+          items:
+            type: string
+            pattern: '^[0-9]{1,20}$'
+          maxItems: 5000
+          description: |
+            History snapshot timestamps (the keys from the watch history) to keep for ever.
+            Snapshot retention never deletes a pinned snapshot, even when it falls outside the
+            configured number-of-snapshots / age limits. Timestamps that are no longer in the
+            history are dropped automatically.
 
         # Scheduling
         time_schedule_limit:

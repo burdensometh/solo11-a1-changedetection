@@ -1203,6 +1203,21 @@ class globalSettingsApplicationForm(commonSettingsForm):
                                                                                                      message=_l("Should contain zero or more attempts"))])
 
     history_snapshot_max_length = IntegerField(_l('Number of history items per watch to keep'), render_kw={"style": "width: 5em;"}, validators=[validators.Optional(), validators.NumberRange(min=2)])
+    snapshot_retention_enabled = BooleanField(
+        _l('Delete old history snapshots'), default=True,
+    )
+    # TRANSLATORS: 'Number of history snapshots' labels the retention "keep the newest N" setting
+    snapshot_retention_keep_last = IntegerField(
+        _l('Keep the newest number of history snapshots'), default=30,
+        render_kw={"style": "width: 5em;"},
+        validators=[validators.Optional(), validators.NumberRange(min=0)],
+    )
+    # TRANSLATORS: 'Number of days' labels the retention "nothing older than N days" setting
+    snapshot_retention_keep_days = IntegerField(
+        _l('Delete history snapshots older than this many days'), default=30,
+        render_kw={"style": "width: 5em;"},
+        validators=[validators.Optional(), validators.NumberRange(min=0)],
+    )
     ui = FormField(globalSettingsApplicationUIForm)
 
 
