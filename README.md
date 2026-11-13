@@ -299,6 +299,8 @@ Easily [import your list of websites to watch for changes in Excel .xslx file fo
 
 Excel import is recommended - that way you can better organise tags/groups of websites and other features.
 
+Moving to a new machine? The import page's **Watch config (JSON)** tab exports every watch's URL, selectors, filtering rules and notification settings to one JSON file. On import, watches are matched by URL: existing ones are updated in place instead of duplicated, and any entry that fails is reported on its own without rolling back the rest of the batch.
+
 
 ## API Support
 

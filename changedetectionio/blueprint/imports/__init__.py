@@ -1,12 +1,86 @@
-from flask import Blueprint, request, redirect, url_for, flash, render_template
+from flask import Blueprint, flash, make_response, redirect, render_template, request, url_for
+from flask_babel import gettext
 from loguru import logger
 
-from changedetectionio.store import ChangeDetectionStore
 from changedetectionio.auth_decorator import login_optionally_required
+from changedetectionio.store import ChangeDetectionStore
+
+
+def _read_watch_config_payload():
+    """Extract the watch-config JSON text from either an uploaded file or a pasted form field.
+
+    Returns (raw_text, error_redirect): error_redirect is a redirect response when the
+    upload itself could not be read, otherwise None.
+    """
+    upload = request.files.get('watch_config_file')
+    if upload and upload.filename:
+        try:
+            return upload.read().decode('utf-8', errors='replace'), None
+        except OSError as e:
+            logger.error(f"Could not read watch config upload: {e}")
+            flash(str(e), 'error')
+            return '', redirect(url_for('imports.import_page'))
+
+    # Also accept pasted JSON so the page works without a file picker.
+    return request.values.get('watch_config_json') or '', None
+
+
+def export_watch_config_response(datastore):
+    """Build the downloadable watch-config JSON response (view logic, kept out of the blueprint factory)."""
+    import json as json_module
+
+    from changedetectionio.blueprint.imports.watch_config import build_export_document
+
+    document = build_export_document(datastore)
+    response = make_response(json_module.dumps(document, indent=2, ensure_ascii=False))
+    response.headers['Content-Type'] = 'application/json; charset=utf-8'
+    response.headers['Content-Disposition'] = 'attachment; filename="watch-config.json"'
+    return response
+
+
+def import_watch_config_response(datastore):
+    """Handle a watch-config JSON upload: update by URL, create the rest, report each failure on its own."""
+    from changedetectionio.blueprint.imports.watch_config import (
+        WatchConfigImportError,
+        import_watch_config,
+        parse_export_document,
+    )
+
+    raw_text, error_redirect = _read_watch_config_payload()
+    if error_redirect:
+        return error_redirect
+
+    if not raw_text.strip():
+        flash(
+            gettext("No watch config file selected, choose a .json export file to import."), 'error'
+        )
+        return redirect(url_for('imports.import_page'))
+
+    try:
+        entries = parse_export_document(raw_text)
+    except WatchConfigImportError as e:
+        flash(str(e), 'error')
+        return redirect(url_for('imports.import_page'))
+
+    import_watch_config(datastore=datastore, entries=entries, flash=flash)
+    return redirect(url_for('watchlist.index'))
+
 
 def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMetaData):
     import_blueprint = Blueprint('imports', __name__, template_folder="templates")
-    
+
+    @import_blueprint.route("/export/watch-config.json", methods=['GET'])
+    @login_optionally_required
+    def export_watch_config():
+        """Download every watch's portable configuration (URL, selectors, filters, notifications) as JSON."""
+        return export_watch_config_response(datastore)
+
+    @import_blueprint.route("/import/watch-config", methods=['POST'])
+    @login_optionally_required
+    def import_watch_config_page():
+        """Import a watch-config JSON export (matched by URL, per-entry failures, no batch rollback)."""
+        return import_watch_config_response(datastore)
+
     @import_blueprint.route("/import", methods=['GET', 'POST'])
     @login_optionally_required
     def import_page():
@@ -17,10 +91,10 @@ def construct_blueprint(datastore: ChangeDetectionStore, update_q, queuedWatchMe
 #            from changedetectionio import worker_pool
 
             from changedetectionio.blueprint.imports.importer import (
-                import_url_list,
                 import_distill_io_json,
+                import_url_list,
+                import_xlsx_custom,
                 import_xlsx_wachete,
-                import_xlsx_custom
             )
 
             # URL List import

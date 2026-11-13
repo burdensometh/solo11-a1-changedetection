@@ -7,6 +7,7 @@
     <div class="tabs collapsable">
         <ul>
             <li class="tab" id=""><a href="#url-list">{{ _('URL List') }}</a></li>
+            <li class="tab"><a href="#watch-config-json">{{ _('Watch config (JSON)') }}</a></li>
             <li class="tab"><a href="#distill-io">Distill.io</a></li>
             <li class="tab"><a href="#xlsx">{{ _('.XLSX & Wachete') }}</a></li>
             <li class="tab"><a href="{{url_for('backups.restore.restore')}}">{{ _('Backup Restore') }}</a></li>
@@ -120,6 +121,29 @@
             <button type="submit" class="pure-button pure-input-1-2 pure-button-primary">{{ _('Import') }}</button>
 
         </form>
+
+        <div class="tab-pane-inner" id="watch-config-json">
+            <div class="pure-control-group">
+                <p>
+                    {{ _('Export all watches (URL, selectors, filtering rules and notification settings) to a single JSON file and import them again on another instance.') }}
+                </p>
+                <p>
+                    <a class="pure-button" href="{{ url_for('imports.export_watch_config') }}">
+                        {{ _('Export watch config (.json)') }}
+                    </a>
+                </p>
+            </div>
+            <form class="pure-form" action="{{ url_for('imports.import_watch_config_page') }}" method="POST" enctype="multipart/form-data">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <div class="pure-control-group">
+                    <p>
+                        {{ _('On import, watches are matched by URL: an existing URL has its configuration updated and is never duplicated. Failures are reported per watch and do not roll back the others.') }}
+                    </p>
+                    <input type="file" name="watch_config_file" accept=".json,application/json" required>
+                </div>
+                <button type="submit" class="pure-button pure-button-primary">{{ _('Import watch config') }}</button>
+            </form>
+        </div>
 
     </div>
 </div>

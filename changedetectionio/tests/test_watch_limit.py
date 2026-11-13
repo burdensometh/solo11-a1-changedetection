@@ -220,3 +220,42 @@ def test_limit_reported_without_a_request_context(client, live_server, measure_m
     assert len(datastore.data['watching']) == 1
 
     delete_all_watches(client)
+
+
+def test_watch_config_import_reports_limit_per_entry_without_rollback(
+    client, live_server, measure_memory_usage, datastore_path, monkeypatch
+):
+    """At PAGE_WATCH_LIMIT, watch-config updates still succeed while new creates are
+    reported per entry; the batch is never rolled back."""
+    import io
+
+    datastore = live_server.app.config['DATASTORE']
+    existing_url = 'https://example.com/limited-existing'
+    existing_uuid = datastore.add_watch(url=existing_url, extras={'title': 'Old title'})
+
+    monkeypatch.setenv('PAGE_WATCH_LIMIT', '1')
+
+    payload = {
+        'watches': [
+            # Existing URL: an update, not a create - must succeed despite the limit
+            {'url': existing_url, 'title': 'New title'},
+            # New URL: blocked by the limit, reported on its own
+            {'url': 'https://example.com/limited-new'},
+        ]
+    }
+
+    res = client.post(
+        url_for('imports.import_watch_config_page'),
+        data={'watch_config_file': (io.BytesIO(json.dumps(payload).encode()), 'watch-config.json')},
+        content_type='multipart/form-data',
+        follow_redirects=True,
+    )
+
+    assert b'0 created' in res.data
+    assert b'1 updated' in res.data
+    assert b'1 failed' in res.data
+    assert b'Watch limit reached' in res.data
+    assert len(datastore.data['watching']) == 1
+    assert datastore.data['watching'][existing_uuid]['title'] == 'New title'
+
+    delete_all_watches(client)
