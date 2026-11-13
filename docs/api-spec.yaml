@@ -396,6 +396,15 @@ components:
         webdriver_delay:
           type: [integer, 'null']
           description: Delay in seconds for webdriver
+        timeout:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 9999
+          description: |
+            Per-watch fetch timeout in seconds. When null (or omitted) the system-wide
+            requests timeout is used (default 30 seconds). A watch that times out three
+            times in a row has its effective timeout doubled once automatically; the
+            internal backoff state is not part of this schema.
         webdriver_js_execute_code:
           type: [string, 'null']
           description: JavaScript code to execute

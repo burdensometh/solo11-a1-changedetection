@@ -29,6 +29,11 @@ SYSTEM_MANAGED_NON_SPEC_FIELDS = frozenset({
     'llm_evaluation_cache',
     'llm_last_tokens_used',
     'llm_tokens_used_cumulative',
+    # Fetch-timeout policy state (changedetectionio/fetch_timeout.py) - counters and the
+    # one-shot backoff are internal bookkeeping, not user-settable API fields.
+    'consecutive_timeouts',
+    'timeout_backoff_active',
+    'timeout_backoff_notice',
 })
 
 

@@ -896,6 +896,11 @@ class commonSettingsForm(Form):
     processor = RadioField( label=_l("Processor - What do you want to achieve?"), choices=lambda: processors.available_processors(), default=processors.get_default_processor)
     scheduler_timezone_default = StringField(_l("Default timezone for watch check scheduler"), render_kw={"list": "timezones"}, validators=[validateTimeZoneName()])
     webdriver_delay = IntegerField(_l('Wait seconds before extracting text'), validators=[validators.Optional(), validators.NumberRange(min=1, message=_l("Should contain one or more seconds"))])
+    timeout = IntegerField(_l('Fetch timeout in seconds'),
+                           render_kw={"style": "width: 5em;"},
+                           validators=[validators.Optional(),
+                                       validators.NumberRange(min=1, max=9999,
+                                                              message=_l("Should be between 1 and 9999 seconds"))])
 
 # Not true anymore but keep the validate_ hook for future use, we convert color tags
 #    def validate_notification_urls(self, field):

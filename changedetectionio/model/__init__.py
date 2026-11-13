@@ -237,6 +237,15 @@ class watch_base(dict):
             'text_should_not_be_present': [],  # Text that should not present
             'time_between_check': {'weeks': None, 'days': None, 'hours': None, 'minutes': None, 'seconds': None},
             'time_between_check_use_default': True,
+            # Per-watch fetch timeout override in seconds; None means use the system-wide setting.
+            'timeout': None,
+            # Consecutive checks that ended in a fetch timeout; reset by any non-timeout check.
+            'consecutive_timeouts': 0,
+            # Set once after TIMEOUT_BACKOFF_AFTER_CONSECUTIVE timeouts; doubles the effective
+            # timeout until a non-timeout check clears it. One-shot, it never doubles again.
+            'timeout_backoff_active': False,
+            # Human-readable note recorded when the backoff triggers (see changedetectionio/fetch_timeout.py).
+            'timeout_backoff_notice': None,
             "time_schedule_limit": {
                 "enabled": False,
                 "monday": {

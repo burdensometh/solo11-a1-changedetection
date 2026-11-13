@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 
 from changedetectionio.browser_steps.browser_steps import browser_steps_get_valid_steps
@@ -225,7 +226,10 @@ class difference_detection_processor():
             if isinstance(value, str) and JINJA2_MARKER_PATTERN.search(value):
                 request_headers.update({header_name: jinja_render(template_str=value)})
 
-        timeout = self.datastore.data['settings']['requests'].get('timeout')
+        # Per-watch timeout: the watch's own override (or the system default), doubled while its
+        # consecutive-timeout backoff is active. See changedetectionio/fetch_timeout.py.
+        from changedetectionio.fetch_timeout import get_effective_timeout
+        timeout = get_effective_timeout(self.watch, self.datastore)
 
         request_body = self.watch.get('body')
         if request_body and JINJA2_MARKER_PATTERN.search(request_body):
@@ -269,15 +273,33 @@ class difference_detection_processor():
             url=url,
             watch_uuid=self.watch_uuid,
         )
-        from changedetectionio.content_fetchers.exceptions import checksumFromPreviousCheckWasTheSame
-        # All fetchers are now async
+        from changedetectionio.content_fetchers.exceptions import checksumFromPreviousCheckWasTheSame, WatchFetchTimeout
+        # The hard guard makes the effective timeout a deadline for browser fetchers, which don't
+        # all honor the timeout argument. The plaintext requests fetcher already applies the timeout
+        # to every socket call itself (and raises the precise ReadTimeout/ConnectTimeout), but its
+        # urllib3 retry/backoff can legitimately run longer than one timeout while recovering, so
+        # give that backend a grace window instead of mislabelling e.g. a DNS failure as a timeout.
+        guard_timeout = self._guard_timeout(timeout)
         try:
-            await self.fetcher.run(**run_args)
+            await asyncio.wait_for(self.fetcher.run(**run_args), timeout=guard_timeout)
         except checksumFromPreviousCheckWasTheSame:
             # Not a failure, the page is just the same as last time
             raise
+        except asyncio.TimeoutError as e:
+            await self._safe_quit_fetcher()
+            raise WatchFetchTimeout(
+                f"Fetch timed out after {timeout} seconds",
+                timeout_seconds=timeout,
+            ) from e
         except Exception as failed_fetch:
-            await self._fetch_with_fallbacks(failed_fetch, prefer_fetch_backend, preferred_proxy_id, run_args)
+            try:
+                await self._fetch_with_fallbacks(failed_fetch, prefer_fetch_backend, preferred_proxy_id, run_args)
+            except asyncio.TimeoutError as e:
+                await self._safe_quit_fetcher()
+                raise WatchFetchTimeout(
+                    f"Fetch timed out after {timeout} seconds",
+                    timeout_seconds=timeout,
+                ) from e
 
         # @todo .quit here could go on close object, so we can run JS if change-detected
         await self.fetcher.quit(watch=self.watch)
@@ -336,13 +358,41 @@ class difference_detection_processor():
             self.fetcher.fallback_from = tried[0]
             tried.append(backend_name)
             try:
-                await self.fetcher.run(**run_args)
+                # Same deadline guard as the primary fetch (call_browser), backend-aware
+                await asyncio.wait_for(self.fetcher.run(**run_args),
+                                       timeout=self._guard_timeout(run_args.get('timeout')))
                 return
             except checksumFromPreviousCheckWasTheSame:
                 raise
             except Exception as e:
                 failed_fetch, failed_backend = e, backend_name
         raise failed_fetch
+
+    async def _safe_quit_fetcher(self):
+        """Best-effort browser/connection cleanup after a timeout - a quit() that raises must not
+        mask the timeout the worker is about to handle."""
+        try:
+            await self.fetcher.quit(watch=self.watch)
+        except Exception as e:
+            logger.debug(f"Ignoring fetcher quit() failure after timeout: {e}")
+
+    # Plaintext/HTTP fetchers apply the timeout to each socket call themselves; this extra grace
+    # window only absorbs their retry/backoff (e.g. several DNS/connect attempts), it doesn't make
+    # a genuinely slow response look fast - the per-call timeout still fires at the configured value.
+    REQUESTS_FETCHER_GRACE_SECONDS = int(os.getenv('REQUESTS_FETCHER_GRACE_SECONDS', 30))
+
+    def _guard_timeout(self, configured_timeout):
+        """The wait_for() deadline for the current fetcher.
+
+        Browser fetchers get the configured timeout verbatim (they don't reliably honor it
+        internally, so the guard is the real deadline). The plaintext requests fetcher gets a
+        grace window on top, because its urllib3 retries can span more than one timeout while
+        surfacing a precise network error that must not be flattened into a generic timeout.
+        """
+        backend = getattr(self.fetcher, 'backend_name', '') or ''
+        if backend == 'html_requests':
+            return (configured_timeout or 0) + self.REQUESTS_FETCHER_GRACE_SECONDS
+        return configured_timeout
 
     def _new_fetcher(self, fetcher_obj, backend_name, custom_browser_connection_url, preferred_proxy_id):
         """An instance of fetcher_obj set up for this watch: proxy, browser steps, render delay, JS to run."""

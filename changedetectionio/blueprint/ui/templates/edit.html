@@ -171,6 +171,12 @@
                 <!-- webdriver always -->
                 <fieldset data-visible-for="fetch_backend=html_webdriver"  style="display: none;">
                     <div class="pure-control-group">
+                        {{ render_field(form.timeout) }}
+                        <span class="pure-form-message-inline">
+                            {{ _('Maximum time in seconds to wait for the site to respond. Leave empty to use the system default (30 seconds).') }}
+                        </span>
+                    </div>
+                    <div class="pure-control-group">
                         {{ render_field(form.webdriver_delay) }}
                         <div class="pure-form-message-inline">
                             <strong>{{ _('If you\'re having trouble waiting for the page to be fully rendered (text missing etc), try increasing the \'wait\' time here.') }}</strong>
@@ -192,8 +198,14 @@
                         </div>
                     </div>
                 </fieldset>
-                <!-- html requests always -->
+            <!-- html requests always -->
                 <fieldset data-visible-for="fetch_backend=html_requests">
+                    <div class="pure-control-group">
+                        {{ render_field(form.timeout) }}
+                        <span class="pure-form-message-inline">
+                            {{ _('Maximum time in seconds to wait for the site to respond. Leave empty to use the system default (30 seconds).') }}
+                        </span>
+                    </div>
                     <div class="pure-control-group">
                         <a class="pure-button button-secondary button-xsmall show-advanced">{{ _('Show advanced options') }}</a>
                     </div>

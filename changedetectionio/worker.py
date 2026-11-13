@@ -161,6 +161,9 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                 contents = b''
                 process_changedetection_results = True
                 update_obj = {}
+                # Set when this attempt ended in a fetch timeout; the finally block resets the
+                # timeout streak for every other outcome (success or a different kind of failure).
+                this_attempt_was_timeout = False
 
                 # Clear last errors
                 datastore.data['watching'][uuid]['browser_steps_last_error_step'] = None
@@ -339,12 +342,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     datastore.update_watch(uuid=uuid,
                                          update_obj={'last_error': e.msg})
                     process_changedetection_results = False
-                    
-                except content_fetchers_exceptions.BrowserFetchTimedOut as e:
-                    datastore.update_watch(uuid=uuid,
-                                         update_obj={'last_error': e.msg})
-                    process_changedetection_results = False
-                    
+
                 except content_fetchers_exceptions.BrowserStepsStepException as e:
                     if not datastore.data['watching'].get(uuid):
                         continue
@@ -426,11 +424,51 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     logger.error(f"Exception (BrowserStepsInUnsupportedFetcher) reached processing watch UUID: {uuid}")
 
                 except Exception as e:
-                    import traceback
-                    logger.error(f"Worker {worker_id} exception processing watch UUID: {uuid}")
-                    logger.exception(f"Worker {worker_id} full exception details:")
-                    datastore.update_watch(uuid=uuid, update_obj={'last_error': "Exception: " + str(e)})
-                    process_changedetection_results = False
+                    from changedetectionio.fetch_timeout import (
+                        is_timeout_exception, record_timeout,
+                        schedule_timeout_retry, get_timeout_attempts, get_timeout_backoff_notice,
+                    )
+
+                    if is_timeout_exception(e):
+                        # A timeout is a retryable failure: nothing is written to the change history
+                        # (process_changedetection_results stays False and no snapshot is saved), the
+                        # consecutive-timeout streak is bumped, and the watch is requeued for another
+                        # attempt while retries remain.
+                        try:
+                            from changedetectionio.fetch_timeout import get_effective_timeout
+                            effective_timeout = get_effective_timeout(watch, datastore)
+                        except Exception:
+                            effective_timeout = getattr(e, 'timeout_seconds', None)
+
+                        attempts = get_timeout_attempts(queued_item_data.item)
+                        notice = record_timeout(watch, datastore)
+
+                        retried = False
+                        if datastore.data['watching'].get(uuid):
+                            retry_item = schedule_timeout_retry(
+                                q, uuid, queued_item_data.priority, attempts)
+                            retried = retry_item is not None
+
+                        message = f"Fetch timed out after {effective_timeout} seconds ({type(e).__name__}: {str(e)})"
+                        if retried:
+                            message += " - retrying, this attempt is not recorded as a change."
+                        else:
+                            message += (f" after {attempts + 1} attempt(s); it will be retried on the next "
+                                        f"scheduled check. This timeout is not recorded as a change.")
+                        if notice:
+                            message = f"{notice} {message}"
+                        elif get_timeout_backoff_notice(watch):
+                            message = f"{get_timeout_backoff_notice(watch)} {message}"
+
+                        logger.warning(f"Worker {worker_id} watch {uuid} - {message}")
+                        datastore.update_watch(uuid=uuid, update_obj={'last_error': message})
+                        process_changedetection_results = False
+                        this_attempt_was_timeout = True
+                    else:
+                        logger.error(f"Worker {worker_id} exception processing watch UUID: {uuid}")
+                        logger.exception(f"Worker {worker_id} full exception details:")
+                        datastore.update_watch(uuid=uuid, update_obj={'last_error': "Exception: " + str(e)})
+                        process_changedetection_results = False
 
                 else:
                     if not datastore.data['watching'].get(uuid):
@@ -700,6 +738,16 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                 # Capture references for plugin finalize hook BEFORE cleanup
                 # (cleanup may delete these variables, but plugins need the original references)
                 finalize_watch = watch              # Capture now, before any modifications
+
+                # Single place that breaks the consecutive-timeout streak: every completed attempt
+                # that did NOT time out (success, unchanged content, or any other kind of failure)
+                # clears the streak and the one-shot doubled-timeout backoff.
+                if watch is not None and not this_attempt_was_timeout:
+                    try:
+                        from changedetectionio.fetch_timeout import reset_timeout_state
+                        reset_timeout_state(watch)
+                    except Exception as reset_e:
+                        logger.debug(f"Could not reset timeout state for {uuid}: {reset_e}")
 
                 # Call quit() as backup (Puppeteer/Playwright have internal cleanup, but this acts as safety net)
                 try:

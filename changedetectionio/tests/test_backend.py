@@ -207,7 +207,10 @@ def test_title_scraper_html_only(client, live_server, measure_memory_usage, data
 
 
 # Server says its plaintext, we should always treat it as plaintext, and then if they have a filter, try to apply that
-def test_requests_timeout(client, live_server, measure_memory_usage, datastore_path):
+def test_requests_timeout(client, live_server, measure_memory_usage, datastore_path, monkeypatch):
+    # No automatic retries here: the timeout message and the backoff bookkeeping are asserted directly.
+    monkeypatch.setattr('changedetectionio.fetch_timeout._max_attempts', lambda: 1)
+
     delay = 2
     test_url = url_for('test_endpoint', delay=delay, _external=True)
 
@@ -228,7 +231,14 @@ def test_requests_timeout(client, live_server, measure_memory_usage, datastore_p
     time.sleep(1)
     # requests takes >2 sec but we timeout at 1 second
     res = client.get(url_for("watchlist.index"))
-    assert b'Read timed out. (read timeout=1)' in res.data
+    assert b'Fetch timed out after 1 seconds' in res.data
+
+    datastore = client.application.config.get('DATASTORE')
+    watch = datastore.data['watching'][uuid]
+    # A timeout is retryable bookkeeping, never a change-history entry
+    assert len(watch.history.keys()) == 0
+    # The streak counter recorded at least one timeout (the scheduler may have run more than one)
+    assert watch.get('consecutive_timeouts') >= 1
 
     ##### Now set a longer timeout
     res = client.post(
@@ -239,12 +249,19 @@ def test_requests_timeout(client, live_server, measure_memory_usage, datastore_p
               'application-fetch_backend': "html_requests"},
         follow_redirects=True
     )
+    # The previous timeout left a streak behind; a real deployment clears it on the next
+    # successful check. Reset it here so this phase asserts the longer-timeout path cleanly.
+    from changedetectionio.fetch_timeout import reset_timeout_state
+    reset_timeout_state(datastore.data['watching'][uuid])
     client.post(url_for("ui.form_watch_checknow"), follow_redirects=True)
 
     wait_for_all_checks(client)
 
     res = client.get(url_for("watchlist.index"))
-    assert b'Read timed out' not in res.data
+    assert b'Fetch timed out' not in res.data
+    # The successful check cleared the timeout streak again
+    assert datastore.data['watching'][uuid].get('consecutive_timeouts') == 0
+    assert not datastore.data['watching'][uuid].get('timeout_backoff_active')
 
 def test_non_text_mime_or_downloads(client, live_server, measure_memory_usage, datastore_path):
     """

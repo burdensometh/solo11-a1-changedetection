@@ -42,6 +42,12 @@ class BrowserFetchTimedOut(Exception):
         logger.error(f"Browser processing took too long - {msg}")
         return
 
+
+# The single definition lives with the timeout policy; re-exported here so callers that import
+# content-fetcher exceptions together (e.g. the worker) can keep using this path.
+from changedetectionio.fetch_timeout import WatchFetchTimeout  # noqa: E402,F401
+
+
 class BrowserStepsStepException(Exception):
     def __init__(self, step_n, original_e):
         self.step_n = step_n

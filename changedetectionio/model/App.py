@@ -30,7 +30,7 @@ class model(dict):
                     'jitter_seconds': 0,
                     'proxy': None, # Preferred proxy connection
                     'time_between_check': {'weeks': None, 'days': None, 'hours': 3, 'minutes': None, 'seconds': None},
-                    'timeout': int(getenv("DEFAULT_SETTINGS_REQUESTS_TIMEOUT", "45")),  # Default 45 seconds
+                    'timeout': int(getenv("DEFAULT_SETTINGS_REQUESTS_TIMEOUT", "30")),  # Default 30 seconds; overridable per watch
                     'workers': int(getenv("DEFAULT_SETTINGS_REQUESTS_WORKERS", "5")),  # Number of threads, lower is better for slow connections
                     'default_ua': {
                         'html_requests': getenv("DEFAULT_SETTINGS_HEADERS_USERAGENT", DEFAULT_SETTINGS_HEADERS_USERAGENT),
