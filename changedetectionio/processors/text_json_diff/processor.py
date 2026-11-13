@@ -544,9 +544,23 @@ class perform_site_check(difference_detection_processor):
         # Track the content type (readonly field, doesn't trigger was_edited)
         update_obj['content-type'] = ctype_header  # Use hyphen (matches OpenAPI spec and watch_base default)
 
-        # Save the raw content checksum to file (processor implementation detail, not watch config)
-        self.update_last_raw_content_checksum(current_raw_document_checksum)
-        update_obj['last_filter_config_hash'] = current_filter_config_hash
+        # An empty-shell reply (only a frame and scripts, no body text - see empty_shell) must not become
+        # the "raw content unchanged" baseline: every later check of the same site reply would take the
+        # unchanged shortcut, bypassing the empty-page check entirely and reporting a healthy, never-changing
+        # monitor. A page with filters of its own, or where the user said empty pages are a change, does not
+        # go through the shell handling, so its reply is recorded as usual.
+        from changedetectionio.empty_shell import is_empty_shell
+        empty_pages_are_a_change = self.datastore.data['settings']['application'].get('empty_pages_are_a_change', False)
+        shell_reply = (stream_content_type.is_html
+                       and not empty_pages_are_a_change
+                       and not filter_config.has_include_filters
+                       and not filter_config.extract_text
+                       and not filter_config.extract_lines_containing
+                       and is_empty_shell(self.fetcher.content))
+        if not shell_reply:
+            # Save the raw content checksum to file (processor implementation detail, not watch config)
+            self.update_last_raw_content_checksum(current_raw_document_checksum)
+            update_obj['last_filter_config_hash'] = current_filter_config_hash
 
         # === CONTENT PREPROCESSING ===
         content = content_processor.preprocess(self.fetcher.content, stream_content_type)
@@ -572,7 +586,19 @@ class perform_site_check(difference_detection_processor):
 
 
         # === EMPTY PAGE CHECK ===
-        empty_pages_are_a_change = self.datastore.data['settings']['application'].get('empty_pages_are_a_change', False)
+        # A reply that is an "empty shell" (only a frame and scripts, no body text, see empty_shell)
+        # was never really seen: call_browser() has already given a browser one go at it. That is a
+        # failed check (the worker records it as such and writes no history), never a change.
+        if shell_reply:
+            raise content_fetchers.exceptions.ReplyWithContentButNoText(
+                url=url,
+                status_code=self.fetcher.get_last_status_code(),
+                screenshot=self.fetcher.screenshot,
+                has_filters=filter_config.has_include_filters,
+                html_content=html_content,
+                xpath_data=self.fetcher.xpath_data,
+                empty_shell=True,
+            )
         if not stream_content_type.is_json and not empty_pages_are_a_change and len(stripped_text.strip()) == 0:
             raise content_fetchers.exceptions.ReplyWithContentButNoText(
                 url=url,

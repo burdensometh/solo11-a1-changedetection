@@ -86,7 +86,8 @@ class ScreenshotUnavailable(Exception):
 
 
 class ReplyWithContentButNoText(Exception):
-    def __init__(self, status_code, url, screenshot=None, has_filters=False, html_content='', xpath_data=None):
+    def __init__(self, status_code, url, screenshot=None, has_filters=False, html_content='', xpath_data=None,
+                 empty_shell=False):
         # Set this so we can use it in other parts of the app
         self.status_code = status_code
         self.url = url
@@ -94,4 +95,7 @@ class ReplyWithContentButNoText(Exception):
         self.has_filters = has_filters
         self.html_content = html_content
         self.xpath_data = xpath_data
+        # The reply was an empty shell (see changedetectionio.empty_shell) that is still empty after the
+        # browser retry: only the browser can show what the page says, and it found nothing either.
+        self.empty_shell = empty_shell
         return

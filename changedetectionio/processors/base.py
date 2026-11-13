@@ -278,6 +278,10 @@ class difference_detection_processor():
             raise
         except Exception as failed_fetch:
             await self._fetch_with_fallbacks(failed_fetch, prefer_fetch_backend, preferred_proxy_id, run_args)
+            # A fallback may have produced the content below, judge it on the fetcher that actually answered
+            prefer_fetch_backend = self.fetcher.backend_name or prefer_fetch_backend
+
+        await self._retry_empty_shell_with_browser(prefer_fetch_backend, preferred_proxy_id, run_args)
 
         # @todo .quit here could go on close object, so we can run JS if change-detected
         await self.fetcher.quit(watch=self.watch)
@@ -343,6 +347,119 @@ class difference_detection_processor():
             except Exception as e:
                 failed_fetch, failed_backend = e, backend_name
         raise failed_fetch
+
+    async def _retry_empty_shell_with_browser(self, used_backend, preferred_proxy_id, run_args):
+        """A non-browser fetch that answered with an "empty shell" gets one browser fetch.
+
+        Sites that build the page with JavaScript answer the plain HTTP client with the application
+        frame only (see changedetectionio.empty_shell) - nothing there changes between checks, so the
+        monitor looks healthy while the real content is never seen. Not worth a browser when the watch
+        has filters of its own (the user is pointed at a specific element, an empty shell is then a
+        legitimate "filter not found"), or for a PDF/binary watch where the text check does not apply.
+
+        Returns True when a browser then produced real content. When the browser reply is still an
+        empty shell, the fetcher is left holding it: the processor raises ReplyWithContentButNoText
+        (flagged empty_shell) and the worker records that as a failed check, never as a change.
+        Browser failures are swallowed - the first, non-empty-shell answer is what gets processed.
+        """
+        from changedetectionio import empty_shell
+        from changedetectionio.content_fetchers.base import FetcherCapabilities
+
+        if not self.fetcher.content or self.watch.is_pdf or self.watch.is_source_type_url:
+            # 'source:' watches keep the raw reply verbatim, and there is nothing to extract from a PDF here
+            return False
+        if self.datastore.data['settings']['application'].get('empty_pages_are_a_change', False):
+            # The user said an empty page is a change, so it must be recorded as one rather than retried away
+            return False
+        if not empty_shell.is_empty_shell(self.fetcher.content):
+            return False
+
+        current_caps = FetcherCapabilities.from_fetcher(type(self.fetcher))
+        if current_caps.supports_screenshots or current_caps.supports_xpath_element_data:
+            # Already a browser fetch (it renders the page), a second browser try would see the same page
+            return False
+
+        if self._watch_has_filters():
+            logger.debug(f"Watch {self.watch.get('uuid')} - '{used_backend}' returned an empty shell, not retrying "
+                         f"with a browser because the watch has filters of its own")
+            return False
+
+        browser_choice = await self._browser_fetcher_choice(used_backend)
+        if not browser_choice:
+            logger.info(f"Watch {self.watch.get('uuid')} - '{used_backend}' returned an empty shell "
+                        f"(only scripts and no body text), no browser fetcher available to retry with")
+            return False
+
+        fetcher_obj, backend_name, custom_browser_connection_url = browser_choice
+        logger.info(f"Watch {self.watch.get('uuid')} - '{used_backend}' returned an empty shell (only scripts and "
+                    f"no body text), retrying with '{backend_name}'")
+        previous_fetcher = self.fetcher
+        try:
+            await previous_fetcher.quit(watch=self.watch)
+        except Exception as e:
+            logger.debug(f"Closing the '{used_backend}' fetcher before the empty-shell retry: {e}")
+        self.fetcher = self._new_fetcher(fetcher_obj, backend_name, custom_browser_connection_url, preferred_proxy_id)
+        try:
+            await self.fetcher.run(**run_args)
+        except Exception as e:
+            # The browser could not even fetch. Keep the first reply (the shell) so the check is judged on
+            # what we actually received; the worker records it as a failed check either way.
+            logger.warning(f"Watch {self.watch.get('uuid')} - the empty-shell retry with '{backend_name}' failed "
+                           f"({type(e).__name__}: {e}), the '{used_backend}' reply is processed instead")
+            self.fetcher = previous_fetcher
+            return False
+
+        if empty_shell.is_empty_shell(self.fetcher.content):
+            logger.warning(f"Watch {self.watch.get('uuid')} - '{backend_name}' still returned an empty shell "
+                           f"(only scripts and no body text), recording a failed check")
+            return False
+        return True
+
+    def _watch_has_filters(self):
+        """True when filters/'extract' rules point the check at part of the page (watch, group/tag or global)."""
+        from changedetectionio.processors.text_json_diff.processor import FilterConfig
+        filter_config = FilterConfig(self.watch, self.datastore)
+        return bool(filter_config.has_include_filters
+                    or any(r.strip() for r in [*filter_config.extract_text, *filter_config.extract_lines_containing]))
+
+    async def _browser_fetcher_choice(self, used_backend):
+        """(fetcher_class, backend_name, custom_browser_connection_url) for a browser fetcher usable for this
+        watch, or None.
+
+        The usual case is a watch fetched with the plain HTTP client while the install has a browser
+        configured (PLAYWRIGHT_DRIVER_URL or WEBDRIVER_URL) - that browser is what retries the fetch.
+        A plugin may also offer a fetcher through select_fetch_backend (for example a browser-side
+        scraping service), and a watch already pointed at a browser backend keeps that one.
+        """
+        from changedetectionio.content_fetchers import resolve_content_fetcher
+        from changedetectionio.content_fetchers.base import FetcherCapabilities
+        from changedetectionio import content_fetchers
+
+        def usable(fetcher_obj, backend_name, connection_url):
+            if not fetcher_obj or backend_name in (used_backend, 'html_requests'):
+                return None
+            caps = FetcherCapabilities.from_fetcher(fetcher_obj)
+            if not (caps.supports_screenshots or caps.supports_xpath_element_data):
+                return None
+            return fetcher_obj, backend_name, connection_url
+
+        # A plugin offer (a browser on their side) works even where the built-in one is not configured
+        plugin_choice = await self._plugin_fetcher_choice(used_backend, failed_fetch=None, tried=(used_backend,))
+        if plugin_choice:
+            return plugin_choice
+
+        # The watch's own resolved backend, when it is a browser (e.g. an extra_browser_ or plugin fetcher)
+        fetcher_obj, backend_name, custom_browser_connection_url = resolve_content_fetcher(
+            watch=self.watch, datastore=self.datastore)
+        choice = usable(fetcher_obj, backend_name, custom_browser_connection_url)
+        if choice:
+            return choice
+
+        # This install has a browser configured, even though this watch's fetch method is the plain client
+        if os.getenv('PLAYWRIGHT_DRIVER_URL') or os.getenv('WEBDRIVER_URL'):
+            browser_class = getattr(content_fetchers, 'html_webdriver', None)
+            return usable(browser_class, 'html_webdriver', None)
+        return None
 
     def _new_fetcher(self, fetcher_obj, backend_name, custom_browser_connection_url, preferred_proxy_id):
         """An instance of fetcher_obj set up for this watch: proxy, browser steps, render delay, JS to run."""

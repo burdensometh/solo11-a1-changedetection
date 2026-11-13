@@ -235,19 +235,32 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     process_changedetection_results = False
 
                 except content_fetchers_exceptions.ReplyWithContentButNoText as e:
-                    extra_help = ""
-                    if e.has_filters:
-                        has_img = html_tools.include_filters(include_filters='img',
-                                                             html_content=e.html_content)
-                        if has_img:
-                            extra_help = ", it's possible that the filters you have give an empty result or contain only an image."
-                        else:
-                            extra_help = ", it's possible that the filters were found, but contained no usable text."
+                    if e.empty_shell:
+                        # The site only served the application frame (scripts, no body text) even after the
+                        # browser retry - the page was never really seen. That is a failed check, not a change:
+                        # no history, no notification, and the previous snapshot stays the one to compare with.
+                        err_text = (f"Empty page shell received (With {e.status_code} reply code), only scripts and no "
+                                    f"body text - the page most likely needs JavaScript to render, the site may be "
+                                    f"blocking the browser, or the fetch method needs changing.")
+                        datastore.update_watch(uuid=uuid, update_obj={
+                            'last_error': err_text,
+                            'last_check_status': e.status_code
+                        })
+                        logger.warning(f"Watch {uuid} - empty page shell (status {e.status_code}), recorded as a failed check")
+                    else:
+                        extra_help = ""
+                        if e.has_filters:
+                            has_img = html_tools.include_filters(include_filters='img',
+                                                                 html_content=e.html_content)
+                            if has_img:
+                                extra_help = ", it's possible that the filters you have give an empty result or contain only an image."
+                            else:
+                                extra_help = ", it's possible that the filters were found, but contained no usable text."
 
-                    datastore.update_watch(uuid=uuid, update_obj={
-                        'last_error': f"Got HTML content but no text found (With {e.status_code} reply code){extra_help}",
-                        'last_check_status': e.status_code
-                    })
+                        datastore.update_watch(uuid=uuid, update_obj={
+                            'last_error': f"Got HTML content but no text found (With {e.status_code} reply code){extra_help}",
+                            'last_check_status': e.status_code
+                        })
 
                     if e.screenshot:
                         watch.save_screenshot(screenshot=e.screenshot, as_error=True)
@@ -256,7 +269,7 @@ async def async_update_worker(worker_id, q, notification_q, app, datastore, exec
                     if e.xpath_data:
                         watch.save_xpath_data(data=e.xpath_data)
                         e.xpath_data = None  # Free memory immediately
-                        
+
                     process_changedetection_results = False
 
                 except content_fetchers_exceptions.Non200ErrorCodeReceived as e:
